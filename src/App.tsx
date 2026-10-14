@@ -1208,7 +1208,7 @@ export default function App() {
                       SHOP
                     </span>
                   </div>
-                  <p className="hidden sm:block text-[11px] text-zinc-500 font-medium">Official HSG Global Distribution • Carton Wholesale</p>
+                  <p className="hidden sm:block text-[11px] text-zinc-500 font-medium">Official HSG Global Wholesale</p>
                 </div>
               </div>
 
@@ -1851,13 +1851,63 @@ Thank you!`;
                     >
                       {/* Product Image Box */}
                       <div className="relative aspect-square bg-[#F8F9FA] overflow-hidden flex items-center justify-center">
-                        {product.badge_text && (
-                          <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 bg-white/85 backdrop-blur-xs border-y border-white/60 py-1 px-2 z-10 shadow-xs flex items-center justify-center pointer-events-none">
-                            <span className="text-[#0B57D0] text-[11px] sm:text-xs font-black tracking-wider uppercase text-center truncate">
-                              {product.badge_text}
-                            </span>
-                          </div>
-                        )}
+                        {product.badge_text && (() => {
+                          const safeId = String(product.sku).replace(/[^a-zA-Z0-9_-]/g, "_");
+                          const fontSize = product.badge_text.length > 18 ? 3.4 : product.badge_text.length > 13 ? 3.9 : 4.4;
+                          return (
+                            <div className="absolute inset-0 pointer-events-none select-none z-10">
+                              {/* Frosted blur backdrop clipped to matching ribbon polygon */}
+                              <div
+                                className="absolute inset-0 backdrop-blur-2xs"
+                                style={{
+                                  clipPath: "polygon(-2% 34%, 50% 31%, 102% 16%, 102% 37%, 50% 42%, -2% 52%)"
+                                }}
+                              />
+                              <svg
+                                className="absolute inset-0 w-full h-full"
+                                viewBox="0 0 100 100"
+                              >
+                                <defs>
+                                  <filter id={`ribbon-shadow-${safeId}`} x="-10%" y="-10%" width="120%" height="130%">
+                                    <feDropShadow dx="0" dy="1.2" stdDeviation="1.2" floodColor="#000000" floodOpacity="0.35" />
+                                  </filter>
+                                  {/* Center guide curve for the text */}
+                                  <path
+                                    id={`ribbon-text-path-${safeId}`}
+                                    d="M -2 43 Q 50 36.5 102 26.5"
+                                    fill="none"
+                                  />
+                                </defs>
+
+                                {/* Ribbon Body (semi-transparent red ribbon, no outline, right side tilted up) */}
+                                <path
+                                  d="M -2 34 Q 50 31 102 16 L 102 37 Q 50 42 -2 52 Z"
+                                  fill="rgba(220, 38, 38, 0.78)"
+                                  stroke="none"
+                                  filter={`url(#ribbon-shadow-${safeId})`}
+                                />
+
+                                {/* White uppercase text aligned along the ribbon's curve */}
+                                <text
+                                  fill="#ffffff"
+                                  fontSize={fontSize}
+                                  fontWeight="900"
+                                  letterSpacing="0.08em"
+                                  style={{ textTransform: "uppercase" }}
+                                  filter="drop-shadow(0 1px 1.5px rgba(0,0,0,0.85))"
+                                >
+                                  <textPath
+                                    href={`#ribbon-text-path-${safeId}`}
+                                    startOffset="50%"
+                                    textAnchor="middle"
+                                  >
+                                    {product.badge_text}
+                                  </textPath>
+                                </text>
+                              </svg>
+                            </div>
+                          );
+                        })()}
                         <img
                           src={product.image}
                           alt={product.display_name}
