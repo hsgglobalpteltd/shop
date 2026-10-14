@@ -245,7 +245,13 @@ export default function App() {
     store_person_name: "Warehouse Store Person",
     pickup_hours: "Mon - Fri: 10:00 AM - 6:00 PM",
     allow_self_pickup: true,
-    show_hero_section: true
+    show_hero_section: (() => {
+      try {
+        const cached = localStorage.getItem("hsg_show_hero_section");
+        if (cached !== null) return cached === "true";
+      } catch {}
+      return false;
+    })()
   });
 
   // Delivery Method ("doorstep" | "pickup")
@@ -394,6 +400,7 @@ export default function App() {
   const [downloadSuccessToast, setDownloadSuccessToast] = useState<boolean>(false);
   const [copiedToastText, setCopiedToastText] = useState<string>("");
   const [expireToast, setExpireToast] = useState<boolean>(false);
+  const [expirePopupOpen, setExpirePopupOpen] = useState<boolean>(false);
 
   // Checkout & Payment Modals
   const [checkoutModalOpen, setCheckoutModalOpen] = useState<boolean>(false);
@@ -410,6 +417,7 @@ export default function App() {
   const [paymentConfirmedTick, setPaymentConfirmedTick] = useState<boolean>(false);
   const [canPayNowTick, setCanPayNowTick] = useState<boolean>(false);
   const [isSubmittingOrder, setIsSubmittingOrder] = useState<boolean>(false);
+  const [autoVerified, setAutoVerified] = useState<boolean>(false);
 
   // Tracking Screen Route (e.g. /order/HSG-XXXX or ?ref=HSG-XXXX)
   const [trackingOrderRef, setTrackingOrderRef] = useState<string>("");
@@ -514,7 +522,12 @@ export default function App() {
         setBrands(data.brands || []);
         setProducts(data.products || []);
         setPriceRules(data.price_rules || []);
-        if (data.settings) setSettings(data.settings);
+        if (data.settings) {
+          setSettings(data.settings);
+          try {
+            localStorage.setItem("hsg_show_hero_section", String(Boolean(data.settings.show_hero_section)));
+          } catch {}
+        }
       }
     } catch (e) {
       console.error(e);
@@ -1032,6 +1045,7 @@ export default function App() {
     setCreatedOrder(null);
     setSgqrPayload("");
     setTimeLeftSeconds(300);
+    setAutoVerified(false);
   };
 
   // Countdown Timer Ticker for 5-Minute Session
@@ -1068,14 +1082,10 @@ export default function App() {
     }
   };
 
-  // Auto-Expire Action on 00:00 (No mention of draft)
+  // Auto-Expire Action on 00:00 (Opens popup while keeping QR code page blurred in background)
   const handleExpirePayment = async () => {
     const orderToCancel = createdOrder?.order_ref;
-    clearPaymentSession();
-    setPaymentModalOpen(false);
-    setCheckoutModalOpen(true);
-    setExpireToast(true);
-    setTimeout(() => setExpireToast(false), 5000);
+    setExpirePopupOpen(true);
     if (orderToCancel) {
       try {
         await fetch(`${WORKER_URL}/api/shop/orders?ref=${encodeURIComponent(orderToCancel)}`, {
@@ -1113,6 +1123,59 @@ export default function App() {
     // Refresh live order state from backend
     loadTrackedOrder(createdOrder.order_ref);
   };
+
+  // Real-time Polling for PayNow Inbound Bank Transfer (Email Webhook Detection)
+  useEffect(() => {
+    if (!paymentModalOpen || !createdOrder?.order_ref) return;
+
+    let isMounted = true;
+    let pollInterval: any = null;
+    let redirectTimer: any = null;
+
+    pollInterval = setInterval(async () => {
+      try {
+        const res = await fetch(`${WORKER_URL}/api/shop/order-status?ref=${encodeURIComponent(createdOrder.order_ref)}`, {
+          cache: "no-store"
+        });
+        if (!res.ok) return;
+        const data = (await res.json()) as { success: boolean; order: any };
+        if (!isMounted) return;
+
+        if (data?.order?.payment_status === "verified") {
+          clearInterval(pollInterval);
+          setAutoVerified(true);
+
+          const confirmedOrder = data.order || createdOrder;
+
+          // Transition to order tracking/confirmation after 1.2s visual feedback
+          redirectTimer = setTimeout(() => {
+            setCart([]);
+            setAppliedPromoCode("");
+            clearPaymentSession();
+            setTrackedOrder(confirmedOrder);
+            setTrackingOrderRef(confirmedOrder.order_ref);
+            setPaymentModalOpen(false);
+
+            try {
+              const url = new URL(window.location.href);
+              url.searchParams.set("track", confirmedOrder.order_ref);
+              window.history.replaceState(null, "", url.toString());
+            } catch (e) {}
+
+            loadTrackedOrder(confirmedOrder.order_ref);
+          }, 1200);
+        }
+      } catch (err) {
+        // silent fail on network blip
+      }
+    }, 2500);
+
+    return () => {
+      isMounted = false;
+      if (pollInterval) clearInterval(pollInterval);
+      if (redirectTimer) clearTimeout(redirectTimer);
+    };
+  }, [paymentModalOpen, createdOrder?.order_ref]);
 
   // Save / Download QR Code Canvas as PNG (Image 2 style)
   const handleDownloadQR = () => {
@@ -1276,10 +1339,27 @@ Thank you!`;
           }
         };
 
+        // Status in word helper
+        const getStatusWord = () => {
+          if (trackedOrder.fulfillment_status === "completed") {
+            return isPickup ? "Completed (Collected)" : "Delivered";
+          }
+          if (trackedOrder.fulfillment_status === "out_for_delivery") {
+            return "Out for Delivery";
+          }
+          if (trackedOrder.fulfillment_status === "packing" || trackedOrder.fulfillment_status === "in_progress") {
+            return "Packing Cartons";
+          }
+          if (isVerified) {
+            return "Payment Confirmed • Processing";
+          }
+          return "Awaiting Payment Verification";
+        };
+
         return (
           <div className="flex-1 flex flex-col min-h-screen bg-[#F8F9FA] font-primary">
-            {/* Top Header */}
-            <div className="sticky top-0 z-30 bg-white/95 backdrop-blur-xs border-b border-slate-200 py-3.5 px-4 shadow-2xs">
+            {/* Top Header (Identical to Cart, Delivery Details, and PayNow QR pages) */}
+            <div className="sticky top-0 z-20 bg-white/95 backdrop-blur-xs border-b border-slate-200 py-3.5 px-4 shadow-2xs">
               <div className="max-w-5xl mx-auto px-4 flex flex-col items-center justify-center text-center">
                 <button
                   type="button"
@@ -1298,340 +1378,208 @@ Thank you!`;
             </div>
 
             {/* Main Body: 2 Columns on Desktop */}
-            <main className="flex-1 w-full max-w-5xl mx-auto px-4 py-6 md:py-8">
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-              
-              {/* LEFT COLUMN (7 cols): Thank you greeting, Live verification status, WhatsApp handoff, Tracking link, Lifecycle */}
-              <div className="lg:col-span-7 space-y-5">
+            <main className="flex-1 w-full max-w-5xl mx-auto px-4 py-4 sm:py-6">
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
                 
-                {/* 1. Thank You Hero Header */}
-                <div className="space-y-2">
-                  <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-bold shadow-2xs">
-                    <CheckCircle2 size={14} className="text-emerald-600" />
-                    <span>Order Confirmation</span>
-                  </div>
-                  <h1 className="text-2xl sm:text-3xl font-black text-zinc-950 tracking-tight">
-                    Thank you for your order!
-                  </h1>
-                  <p className="text-xs sm:text-sm text-zinc-600 leading-relaxed">
-                    Your order <strong className="font-mono text-zinc-900">{trackedOrder.order_ref}</strong> has been received. Please send your payment screenshot on WhatsApp so our operators can verify and process your shipment.
-                  </p>
-                </div>
-
-                {/* 2. Send Order to WhatsApp Card (Button + Desktop-only QR Code) */}
-                <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-xs space-y-4">
-                  <div>
-                    <div className="flex items-center gap-2 font-bold text-sm text-zinc-900">
-                      <MessageSquare size={16} className="text-[#25D366]" />
-                      <span>Send Order to WhatsApp</span>
-                    </div>
-                    <p className="text-xs text-zinc-500 mt-1 leading-relaxed">
-                      Click the button below to message our customer care team on WhatsApp with your pre-filled receipt details:
+                {/* LEFT COLUMN (7 cols): Greeting, Status in words, WhatsApp with side-by-side QR & logo, Tracking link */}
+                <div className="lg:col-span-7 space-y-3.5">
+                  
+                  {/* 1. Header with order description and current status in words */}
+                  <div className="space-y-1.5 text-center sm:text-left">
+                    <h1 className="text-xl sm:text-2xl font-black text-zinc-950 tracking-tight">
+                      Thank you for your order!
+                    </h1>
+                    <p className="text-xs text-zinc-600 leading-relaxed max-w-lg mx-auto sm:mx-0">
+                      Your order <strong className="font-mono text-zinc-900">{trackedOrder.order_ref}</strong> has been received. Please send your PayNow payment transfer screenshot via WhatsApp so our warehouse team can verify and dispatch your cartons.
                     </p>
+                    <div className="flex flex-wrap items-center justify-center sm:justify-start gap-2 pt-0.5 text-xs">
+                      <span className="text-zinc-500 font-medium">Order Status:</span>
+                      <span
+                        className={`font-bold px-2.5 py-0.5 rounded-full text-xs ${
+                          isVerified
+                            ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                            : "bg-amber-50 text-amber-800 border border-amber-200"
+                        }`}
+                      >
+                        {getStatusWord()}
+                      </span>
+                    </div>
                   </div>
 
-                  {/* Send Button */}
-                  <a
-                    href={waUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="w-full h-12 bg-[#25D366] hover:bg-[#20bd5a] text-white font-extrabold text-sm rounded-full flex items-center justify-center gap-2 transition-transform active:scale-98 shadow-sm cursor-pointer"
-                  >
-                    <Phone size={16} />
-                    <span>Send Order to WhatsApp</span>
-                  </a>
+                  {/* 2. WhatsApp Card: Enriched with larger QR and complete instructions */}
+                  <div className="bg-white border border-slate-200 rounded-2xl p-4.5 sm:p-5 shadow-xs space-y-3">
+                    <div className="flex items-center justify-center sm:justify-start gap-2 font-bold text-xs sm:text-sm text-zinc-900 border-b border-slate-100 pb-2.5">
+                      <div className="w-6 h-6 rounded-full bg-[#25D366] text-white flex items-center justify-center shrink-0">
+                        <svg className="w-3.5 h-3.5 fill-current" viewBox="0 0 24 24">
+                          <path d="M.057 24l1.687-6.163c-1.041-1.804-1.588-3.849-1.587-5.946.003-6.556 5.338-11.891 11.893-11.891 3.181.001 6.167 1.24 8.413 3.488 2.245 2.248 3.481 5.236 3.48 8.414-.003 6.557-5.338 11.892-11.893 11.892-1.99-.001-3.951-.5-5.688-1.448l-6.305 1.654zm6.597-3.807c1.676.995 3.276 1.591 5.392 1.592 5.448 0 9.886-4.434 9.889-9.885.002-5.462-4.415-9.89-9.881-9.892-5.452 0-9.887 4.434-9.889 9.884-.001 2.225.651 3.891 1.746 5.634l-.999 3.648 3.742-.981zm11.387-5.464c-.074-.124-.272-.198-.57-.347-.297-.149-1.758-.868-2.031-.967-.272-.099-.47-.149-.669.149-.198.297-.768.967-.941 1.165-.173.198-.347.223-.644.074-.297-.149-1.255-.462-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.297-.347.446-.521.151-.172.2-.296.3-.495.099-.198.05-.372-.025-.521-.075-.148-.669-1.611-.916-2.206-.242-.579-.487-.501-.669-.51l-.57-.01c-.198 0-.52.074-.792.372s-1.04 1.016-1.04 2.479 1.065 2.876 1.213 3.074c.149.198 2.095 3.2 5.076 4.487.709.306 1.263.489 1.694.626.712.226 1.36.194 1.872.118.571-.085 1.758-.719 2.006-1.413.248-.695.248-1.29.173-1.414z"/>
+                        </svg>
+                      </div>
+                      <span>Send Payment Slip & Confirm Order</span>
+                    </div>
 
-                  {/* Desktop / Window Only QR Code */}
-                  <div className="hidden md:flex flex-col items-center justify-center pt-4 border-t border-slate-100 text-center">
-                    <span className="text-[11px] font-semibold text-zinc-600 mb-3">
-                      On a computer? Scan with your phone's camera to open WhatsApp directly:
-                    </span>
-                    <div className="p-3 bg-white border border-slate-200 rounded-2xl shadow-2xs">
-                      <QRCodeCanvas
-                        value={waUrl}
-                        size={160}
-                        level="M"
-                        fgColor="#0F172A"
-                        bgColor="#FFFFFF"
+                    <div className="flex flex-col sm:flex-row items-center gap-5 pt-0.5">
+                      {/* QR Code (Desktop / Tablet only, hidden on mobile) */}
+                      <div className="hidden sm:flex flex-col items-center shrink-0">
+                        <div className="p-2.5 bg-white border border-slate-200 rounded-2xl shadow-2xs">
+                          <QRCodeCanvas
+                            value={waUrl}
+                            size={145}
+                            level="M"
+                            fgColor="#0F172A"
+                            bgColor="#FFFFFF"
+                          />
+                        </div>
+                        <span className="text-[11px] font-semibold text-zinc-600 mt-1.5">Scan with phone camera</span>
+                      </div>
+
+                      {/* Action Details: Direct button on mobile, side-by-side on desktop */}
+                      <div className="flex-1 space-y-2.5 text-center sm:text-left w-full">
+                        <div className="hidden sm:block">
+                          <div className="font-bold text-xs sm:text-sm text-zinc-900">
+                            Instant WhatsApp Verification
+                          </div>
+                          <p className="text-xs text-zinc-500 mt-1 leading-relaxed">
+                            Scan the QR code with your phone or click below to message our customer care team on WhatsApp with your pre-filled receipt details.
+                          </p>
+                        </div>
+
+                        <div className="pt-0.5">
+                          <a
+                            href={waUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="h-11 sm:h-10 px-5 bg-[#25D366] hover:bg-[#20bd5a] text-white font-bold text-sm sm:text-xs rounded-xl inline-flex items-center justify-center gap-2 transition-transform active:scale-98 shadow-xs cursor-pointer w-full sm:w-auto"
+                          >
+                            <Phone size={15} />
+                            <span>Open WhatsApp Directly</span>
+                          </a>
+                        </div>
+
+                        <div className="text-[11px] text-zinc-400">
+                          Order ref <span className="font-mono font-bold text-zinc-600">{trackedOrder.order_ref}</span> is attached automatically.
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 3. Tracking Link: Desktop only (hidden on mobile) */}
+                  <div className="hidden sm:block bg-slate-50 border border-slate-200 rounded-xl p-3.5 space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-bold text-zinc-800">Order Tracking Link</span>
+                      <span className="text-[10px] text-zinc-400 font-medium">Bookmark or save</span>
+                    </div>
+                    <p className="text-[11px] text-zinc-500">
+                      Save this link to check your payment verification, fulfillment status, and delivery updates anytime.
+                    </p>
+                    <div className="flex items-center gap-2 pt-0.5">
+                      <input
+                        type="text"
+                        readOnly
+                        value={trackingUrl}
+                        className="flex-1 h-8 px-2.5 bg-white border border-slate-300 rounded-lg text-xs font-mono text-zinc-700 select-all focus:outline-none"
                       />
-                    </div>
-                    <span className="text-[10px] text-zinc-400 mt-2">
-                      Scan with phone camera • Instantly launches WhatsApp with pre-filled order receipt
-                    </span>
-                  </div>
-                </div>
-
-                {/* 4. Tracking Link & Copy Button */}
-                <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 shadow-2xs space-y-2">
-                  <div className="flex items-center justify-between">
-                    <div className="text-xs font-bold text-zinc-800">Order Tracking Link</div>
-                    <span className="text-[10px] font-medium text-zinc-500">Bookmark or save</span>
-                  </div>
-                  <p className="text-[11px] text-zinc-500 leading-relaxed">
-                    Save this direct link to check real-time fulfillment status and delivery updates anytime.
-                  </p>
-                  <div className="flex items-center gap-2 pt-1">
-                    <input
-                      type="text"
-                      readOnly
-                      value={trackingUrl}
-                      className="flex-1 h-9 px-3 bg-white border border-slate-300 rounded-lg text-xs font-mono text-zinc-700 select-all focus:outline-none focus:ring-1 focus:ring-[#0B57D0]"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => {
-                        navigator.clipboard.writeText(trackingUrl);
-                        setCopiedToastText("Tracking link");
-                        setTimeout(() => setCopiedToastText(""), 2500);
-                      }}
-                      className="h-9 px-3.5 bg-white border border-slate-200 hover:bg-slate-100 text-zinc-800 text-xs font-bold rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer shrink-0 shadow-2xs active:scale-95"
-                    >
-                      <Copy size={13} />
-                      <span>Copy Link</span>
-                    </button>
-                  </div>
-                </div>
-
-                {/* 5. Stepper Timeline */}
-                <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-xs space-y-4">
-                  <div className="text-xs font-bold text-zinc-900 border-b border-slate-100 pb-2">
-                    Fulfillment Milestones
-                  </div>
-
-                  <div className="space-y-4">
-                    {/* Milestone 1 */}
-                    <div className="flex items-center gap-3">
-                      <div className="w-7 h-7 rounded-full bg-emerald-500 text-white flex items-center justify-center shrink-0">
-                        <Check size={14} />
-                      </div>
-                      <div>
-                        <div className="text-xs font-bold text-zinc-900">Order Placed</div>
-                        <div className="text-[11px] text-zinc-500">Order {trackedOrder.order_ref} recorded in system</div>
-                      </div>
-                    </div>
-
-                    {/* Milestone 2 */}
-                    <div className="flex items-center gap-3">
-                      <div
-                        className={`w-7 h-7 rounded-full flex items-center justify-center shrink-0 ${
-                          isVerified ? "bg-emerald-500 text-white" : "bg-slate-200 text-slate-500"
-                        }`}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          navigator.clipboard.writeText(trackingUrl);
+                          setCopiedToastText("Copied!");
+                          setTimeout(() => setCopiedToastText(""), 2000);
+                        }}
+                        className="h-8 px-3.5 bg-white border border-slate-200 hover:bg-slate-100 text-zinc-700 text-xs font-bold rounded-lg flex items-center gap-1.5 cursor-pointer shrink-0 shadow-2xs transition-colors"
                       >
-                        {isVerified ? <Check size={14} /> : <Clock size={14} />}
-                      </div>
-                      <div>
-                        <div className="text-xs font-bold text-zinc-900">Payment Verification</div>
-                        <div className="text-[11px] text-zinc-500">
-                          {isVerified
-                            ? "Payment verified by HSG Global operator"
-                            : "Awaiting PayNow statement confirmation"}
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Milestone 3 */}
-                    <div className="flex items-center gap-3">
-                      <div
-                        className={`w-7 h-7 rounded-full flex items-center justify-center shrink-0 ${
-                          trackedOrder.fulfillment_status === "in_progress" ||
-                          trackedOrder.fulfillment_status === "packing" ||
-                          trackedOrder.fulfillment_status === "out_for_delivery" ||
-                          trackedOrder.fulfillment_status === "completed"
-                            ? "bg-emerald-500 text-white"
-                            : "bg-slate-200 text-slate-500"
-                        }`}
-                      >
-                        <Package size={14} />
-                      </div>
-                      <div>
-                        <div className="text-xs font-bold text-zinc-900">Warehouse Preparation</div>
-                        <div className="text-[11px] text-zinc-500">Cartons bundled and prepared for release</div>
-                      </div>
-                    </div>
-
-                    {/* Milestone 4 */}
-                    <div className="flex items-center gap-3">
-                      <div
-                        className={`w-7 h-7 rounded-full flex items-center justify-center shrink-0 ${
-                          trackedOrder.fulfillment_status === "completed"
-                            ? "bg-emerald-500 text-white"
-                            : "bg-slate-200 text-slate-500"
-                        }`}
-                      >
-                        {isPickup ? <Building2 size={14} /> : <Truck size={14} />}
-                      </div>
-                      <div>
-                        <div className="text-xs font-bold text-zinc-900">
-                          {isPickup ? "Warehouse Self-Pickup Collection" : "Doorstep Delivery Handover"}
-                        </div>
-                        <div className="text-[11px] text-zinc-500">
-                          {trackedOrder.fulfillment_status === "completed"
-                            ? "Order completed and handed over"
-                            : isPickup
-                            ? "Awaiting collection at Eunos warehouse"
-                            : "Islandwide delivery to your address"}
-                        </div>
-                      </div>
+                        <Copy size={12} />
+                        <span>{copiedToastText || "Copy Link"}</span>
+                      </button>
                     </div>
                   </div>
                 </div>
 
-              </div>
+                {/* RIGHT COLUMN (5 cols): Order Summary Card */}
+                <div className="lg:col-span-5 space-y-3">
+                  <div className="bg-white rounded-2xl p-4 border border-slate-200 shadow-xs space-y-3">
+                    <div className="flex items-center justify-between border-b border-slate-100 pb-2">
+                      <h3 className="font-bold text-zinc-900 text-xs uppercase tracking-wider">Order Summary</h3>
+                      <span className="font-mono text-xs font-bold text-zinc-500">
+                        {trackedOrder.order_ref}
+                      </span>
+                    </div>
 
-              {/* RIGHT COLUMN (5 cols, sticky top): Order Summary Card */}
-              <div className="lg:col-span-5 sticky top-24 space-y-4">
-                <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-xs space-y-4">
-                  <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-                    <h3 className="font-bold text-zinc-900 text-sm">Order Summary</h3>
-                    <span className="font-mono text-xs font-bold text-zinc-500">
-                      {trackedOrder.order_ref}
-                    </span>
-                  </div>
-
-                  <div className="space-y-2 text-xs">
                     <div className="flex justify-between items-baseline">
-                      <span className="text-zinc-600 font-medium">Total Payable:</span>
-                      <span className="text-2xl font-black text-zinc-950">
+                      <span className="text-xs text-zinc-500 font-medium">Total Payable:</span>
+                      <span className="text-xl font-black text-zinc-950">
                         SGD ${Number(trackedOrder.total_amount).toFixed(2)}
                       </span>
                     </div>
-                    <div className="flex justify-between text-zinc-600">
-                      <span>Total Cartons:</span>
-                      <span className="font-bold text-zinc-900">{trackedOrder.total_cartons} Cartons</span>
+
+                    {/* Live Payment Status Indicator */}
+                    {isVerified ? (
+                      <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-2.5 flex items-center justify-between gap-2 text-xs">
+                        <div className="flex items-center gap-2 text-emerald-800">
+                          <Check size={14} className="text-emerald-600 shrink-0" />
+                          <span className="font-bold">Payment Verified</span>
+                        </div>
+                        {trackedOrder.payment_verified_at && (
+                          <span className="text-[10px] font-mono text-emerald-700 shrink-0">
+                            {new Date(trackedOrder.payment_verified_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          </span>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="bg-amber-50 border border-amber-200 rounded-lg p-2.5 flex items-center justify-between gap-2 text-xs text-amber-900">
+                        <div className="flex items-center gap-1.5">
+                          <Clock size={14} className="text-amber-600 shrink-0 animate-pulse" />
+                          <span className="font-semibold">Awaiting WhatsApp screenshot</span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => loadTrackedOrder(trackedOrder.order_ref)}
+                          className="p-1 hover:bg-amber-100 rounded text-amber-800 cursor-pointer transition-colors"
+                          title="Refresh status"
+                        >
+                          <RefreshCw size={13} className={trackingLoading ? "animate-spin" : ""} />
+                        </button>
+                      </div>
+                    )}
+
+                    {/* Fulfillment details */}
+                    <div className="bg-slate-50 rounded-lg p-2.5 border border-slate-200 text-xs text-zinc-700 space-y-0.5">
+                      <div className="flex items-center gap-1 font-bold text-zinc-900">
+                        {isPickup ? <Building2 size={13} className="text-[#0B57D0]" /> : <Truck size={13} className="text-[#0B57D0]" />}
+                        <span>{isPickup ? "Warehouse Self-Pickup" : "Doorstep Delivery"}</span>
+                      </div>
+                      <div className="text-[11px] text-zinc-600 truncate">
+                        {trackedOrder.customer_name} ({trackedOrder.customer_phone})
+                      </div>
+                      <div className="text-[11px] text-zinc-500 truncate">
+                        {isPickup
+                          ? (settings.warehouse_address || "9 Eunos Ave 8A, Singapore 409461")
+                          : `${trackedOrder.delivery_address || ""} ${trackedOrder.unit_no || ""} (S${trackedOrder.postal_code || ""})`}
+                      </div>
                     </div>
+
+                    {/* Carton items breakdown */}
+                    <div className="pt-2 border-t border-slate-100 space-y-1.5">
+                      <div className="flex items-center justify-between text-[10px] font-bold text-zinc-400 uppercase tracking-wider">
+                        <span>Carton Items</span>
+                        <span>{trackedOrder.total_cartons} CTN</span>
+                      </div>
+                      <div className="space-y-1 max-h-24 overflow-y-auto pr-1">
+                        {trackedOrder.items?.map((it: any, idx: number) => (
+                          <div key={idx} className="flex justify-between text-xs py-0.5">
+                            <span className="text-zinc-700 truncate text-[11px]">{it.name}</span>
+                            <span className="font-bold text-zinc-900 ml-2 shrink-0 text-[11px]">{it.carton_qty} ctn</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
                   </div>
-
-                  {/* Live Payment Status Indicator */}
-                  {isVerified ? (
-                    <div className="bg-emerald-50 border border-emerald-200/90 rounded-xl p-3.5 flex items-center justify-between gap-3 shadow-2xs">
-                      <div className="flex items-center gap-3">
-                        <div className="w-8 h-8 rounded-full bg-emerald-500 text-white flex items-center justify-center shrink-0">
-                          <Check size={16} />
-                        </div>
-                        <div>
-                          <div className="text-xs font-bold text-emerald-950 flex items-center gap-1.5">
-                            Payment Received
-                            <span className="text-[10px] font-normal bg-emerald-200/60 text-emerald-900 px-1.5 py-0.5 rounded font-mono">
-                              Verified
-                            </span>
-                          </div>
-                          <div className="text-[11px] text-emerald-800 mt-0.5">
-                            Your PayNow transfer has been confirmed by our operator. Order is in fulfillment!
-                          </div>
-                        </div>
-                      </div>
-                      {trackedOrder.payment_verified_at && (
-                        <span className="text-[10px] font-mono text-emerald-700 shrink-0">
-                          {new Date(trackedOrder.payment_verified_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                        </span>
-                      )}
-                    </div>
-                  ) : (
-                    <div className="bg-amber-50/90 border border-amber-200/90 rounded-xl p-3.5 flex items-center justify-between gap-3 shadow-2xs">
-                      <div className="flex items-center gap-3">
-                        <div className="w-8 h-8 rounded-full bg-amber-500 text-white flex items-center justify-center shrink-0 animate-pulse">
-                          <Clock size={16} />
-                        </div>
-                        <div>
-                          <div className="text-xs font-bold text-amber-950 flex items-center gap-1.5">
-                            Verify Payment
-                            <span className="text-[10px] font-normal bg-amber-200/70 text-amber-900 px-1.5 py-0.5 rounded font-mono">
-                              Pending Review
-                            </span>
-                          </div>
-                          <div className="text-[11px] text-amber-800 mt-0.5">
-                            Awaiting PayNow statement confirmation. Please send your payment screenshot on WhatsApp below.
-                          </div>
-                        </div>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => loadTrackedOrder(trackedOrder.order_ref)}
-                        className="shrink-0 p-1.5 text-amber-700 hover:text-amber-950 hover:bg-amber-100 rounded-lg transition-colors cursor-pointer"
-                        title="Check verification status"
-                      >
-                        <RefreshCw size={14} className={trackingLoading ? "animate-spin" : ""} />
-                      </button>
-                    </div>
-                  )}
-
-                  {/* Fulfillment details */}
-                  {isPickup ? (
-                    <div className="bg-blue-50/70 rounded-xl p-3.5 border border-blue-200/80 text-xs space-y-1.5">
-                      <div className="flex items-center gap-1.5 font-bold text-[#0B57D0]">
-                        <Building2 size={14} />
-                        <span>Fulfillment: Warehouse Self-Pickup</span>
-                      </div>
-                      <div className="text-zinc-900 font-semibold">{trackedOrder.customer_name} ({trackedOrder.customer_phone})</div>
-                      <div className="text-zinc-700 text-[11px] leading-relaxed">
-                        {settings.warehouse_address || "9 Eunos Ave 8A, EUNOS INDUSTRIAL ESTATE, Singapore 409461"}
-                      </div>
-                      <div className="text-zinc-500 text-[10px] pt-1 border-t border-blue-200/60">
-                        Hours: {settings.pickup_hours || "Mon - Fri: 10am - 6pm"}
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="bg-slate-50 rounded-xl p-3.5 border border-slate-200 text-xs space-y-1">
-                      <div className="flex items-center gap-1.5 font-bold text-zinc-800">
-                        <Truck size={14} className="text-[#0B57D0]" />
-                        <span>Fulfillment: Doorstep Delivery</span>
-                      </div>
-                      <div className="text-zinc-900 font-semibold">{trackedOrder.customer_name} ({trackedOrder.customer_phone})</div>
-                      <div className="text-zinc-700 text-[11px]">
-                        {trackedOrder.delivery_address} {trackedOrder.unit_no ? `, ${trackedOrder.unit_no}` : ""}
-                      </div>
-                      <div className="text-zinc-500 text-[11px] font-mono">Singapore {trackedOrder.postal_code}</div>
-                    </div>
-                  )}
-
-                  {/* Carton items breakdown */}
-                  <div className="pt-2 border-t border-slate-100 space-y-2">
-                    <div className="text-[11px] font-bold text-zinc-500 uppercase tracking-wider">
-                      Carton Items ({trackedOrder.items?.length || 0})
-                    </div>
-                    <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
-                      {trackedOrder.items?.map((it: any, idx: number) => (
-                        <div key={idx} className="bg-slate-50 rounded-lg p-2.5 text-xs border border-slate-100">
-                          <div className="flex items-center justify-between gap-2 min-w-0">
-                            <span className="font-semibold text-zinc-900 truncate" title={it.name}>
-                              {it.name}
-                            </span>
-                            <span className="font-bold text-zinc-900 shrink-0 whitespace-nowrap">
-                              {it.carton_qty} CTN
-                            </span>
-                          </div>
-                          {it.loose_bottles && it.loose_bottles.length > 0 && (
-                            <div className="mt-1.5 pt-1.5 border-t border-slate-200/60 text-[11px] text-zinc-600 space-y-0.5">
-                              <span className="text-[10px] font-bold text-zinc-500 uppercase">Mix Flavors:</span>
-                              {it.loose_bottles.map((lb: any, lbIdx: number) => (
-                                <div key={lbIdx} className="flex items-center justify-between gap-2 min-w-0 text-zinc-600">
-                                  <span className="truncate" title={lb.flavor}>{lb.flavor}</span>
-                                  <span className="font-medium shrink-0 whitespace-nowrap">{lb.qty} pcs</span>
-                                </div>
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-
-                  {/* Return button */}
-                  <button
-                    type="button"
-                    onClick={handleBackToStore}
-                    className="w-full h-10 bg-slate-100 hover:bg-slate-200 text-zinc-800 text-xs font-bold rounded-xl flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
-                  >
-                    <span>Back to Storefront</span>
-                    <ArrowRight size={14} />
-                  </button>
                 </div>
-              </div>
 
-            </div>
-          </main>
-        </div>
-      );
+              </div>
+            </main>
+          </div>
+        );
       })() : (
         /* ========================================================= */
         /* MAIN STOREFRONT VIEW                                      */
@@ -1640,7 +1588,7 @@ Thank you!`;
           {/* ========================================================= */}
           {/* HERO SLIDER (FULL WIDTH, NO ROUND CORNERS, MAX 270PX)     */}
           {/* ========================================================= */}
-          {settings.show_hero_section !== false && (
+          {Boolean(settings.show_hero_section) && (
             <section className="w-full h-[200px] sm:h-[235px] md:h-[270px] max-h-[270px] relative overflow-hidden bg-zinc-950 text-white rounded-none select-none shrink-0">
               {slides.map((slide, idx) => {
                 const isActive = idx === currentSlideIndex;
@@ -1797,7 +1745,7 @@ Thank you!`;
               if (brandCartonGroups.length === 0) return null;
 
               return (
-                <div className="bg-gradient-to-r from-amber-500/10 via-amber-500/5 to-transparent border border-amber-500/30 rounded-2xl p-5 sm:p-6 mb-8 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                <div className="bg-gradient-to-r from-blue-500/10 via-blue-500/5 to-transparent border border-blue-500/20 rounded-2xl p-5 sm:p-6 mb-8 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
                   <div>
                     <h3 className="text-base font-extrabold text-zinc-950">
                       Build Your {currentBrand.display_name} Custom Mix Carton
@@ -1811,7 +1759,7 @@ Thank you!`;
                     onClick={() => handleOpenMixBuilder(currentBrand)}
                     className="h-10 px-5 bg-zinc-950 hover:bg-zinc-800 text-white text-xs font-bold rounded-xl flex items-center gap-2 shrink-0 transition-transform active:scale-95 cursor-pointer shadow-sm"
                   >
-                    <Package size={14} className="text-amber-400" />
+                    <Package size={14} className="text-[#0B57D0]" />
                     <span>Build Custom Mix Carton ➔</span>
                   </button>
                 </div>
@@ -1847,7 +1795,7 @@ Thank you!`;
                   return (
                     <div
                       key={product.sku}
-                      className="bg-white rounded-2xl border border-slate-200 shadow-2xs hover:shadow-md transition-all overflow-hidden flex flex-col"
+                      className="group bg-white rounded-2xl border border-slate-200 shadow-2xs hover:shadow-md transition-all overflow-hidden flex flex-col"
                     >
                       {/* Product Image Box */}
                       <div className="relative aspect-square bg-[#F8F9FA] overflow-hidden flex items-center justify-center">
@@ -1911,7 +1859,7 @@ Thank you!`;
                         <img
                           src={product.image}
                           alt={product.display_name}
-                          className="w-full h-full object-cover"
+                          className="w-full h-full object-cover transition-transform duration-500 ease-out group-hover:scale-108 group-hover:rotate-2 transform-gpu"
                           loading="lazy"
                         />
                       </div>
@@ -2185,15 +2133,32 @@ Thank you!`;
                   </div>
 
                   {discountInfo.discountAmount > 0 && (
-                    <div className="flex justify-between text-emerald-600 font-semibold">
-                      <span>Discount ({discountInfo.ruleName}):</span>
-                      <span>-${discountInfo.discountAmount.toFixed(2)}</span>
+                    <div className="flex justify-between items-center text-zinc-600">
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span>Discount ({discountInfo.ruleName}):</span>
+                        {appliedPromoCode && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setAppliedPromoCode("");
+                              setPromoCodeInput("");
+                              setShowPromoInput(false);
+                            }}
+                            className="inline-flex items-center gap-0.5 text-[11px] font-semibold text-red-500 hover:text-red-700 underline cursor-pointer transition-colors"
+                            title="Clear promo code"
+                          >
+                            <X size={11} className="shrink-0 text-red-500" />
+                            <span>Clear</span>
+                          </button>
+                        )}
+                      </div>
+                      <span className="font-semibold text-zinc-900">-${discountInfo.discountAmount.toFixed(2)}</span>
                     </div>
                   )}
 
                   <div className="flex justify-between text-zinc-600">
                     <span>Delivery Fee:</span>
-                    <span className={deliveryFee === 0 ? "text-emerald-600 font-bold" : "text-zinc-900 font-semibold"}>
+                    <span className="font-semibold text-zinc-900">
                       {deliveryFee === 0 ? "FREE" : `$${deliveryFee.toFixed(2)}`}
                     </span>
                   </div>
@@ -2234,14 +2199,26 @@ Thank you!`;
                           )}
                         </div>
                         <div className="flex gap-2">
-                          <input
-                            type="text"
-                            placeholder="EG : HSGGLOBAL"
-                            value={promoCodeInput}
-                            onChange={(e) => setPromoCodeInput(e.target.value.toUpperCase())}
-                            className="flex-1 px-3.5 py-2 bg-white border border-slate-300 rounded-xl text-xs font-mono font-bold uppercase focus:ring-1 focus:ring-[#0B57D0]"
-                            autoFocus
-                          />
+                          <div className="relative flex-1">
+                            <input
+                              type="text"
+                              placeholder="EG : HSGGLOBAL"
+                              value={promoCodeInput}
+                              onChange={(e) => setPromoCodeInput(e.target.value.toUpperCase())}
+                              className="w-full pl-3.5 pr-8 py-2 bg-white border border-slate-300 rounded-xl text-xs font-mono font-bold uppercase focus:ring-1 focus:ring-[#0B57D0]"
+                              autoFocus
+                            />
+                            {promoCodeInput && (
+                              <button
+                                type="button"
+                                onClick={() => setPromoCodeInput("")}
+                                className="absolute right-2 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600 p-1 cursor-pointer"
+                                title="Clear input text"
+                              >
+                                <X size={13} />
+                              </button>
+                            )}
+                          </div>
                           <button
                             type="button"
                             onClick={() => {
@@ -2269,13 +2246,13 @@ Thank you!`;
                                   }}
                                   className="text-[10px] text-zinc-500 hover:text-zinc-800 underline shrink-0 cursor-pointer"
                                 >
-                                  Remove
+                                  Clear
                                 </button>
                               </div>
                             ) : (
-                              <div className="text-[11px] text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg p-2.5 flex items-center justify-between">
+                              <div className="text-[11px] text-zinc-700 bg-slate-100 border border-slate-200 rounded-lg p-2.5 flex items-center justify-between">
                                 <div className="flex items-center gap-1.5">
-                                  <CheckCircle2 size={13} className="text-emerald-600 shrink-0" />
+                                  <CheckCircle2 size={13} className="text-[#0B57D0] shrink-0" />
                                   <span>
                                     Applied <strong>{appliedPromoCode}</strong>
                                     {discountInfo.promoDesc ? ` (${discountInfo.promoDesc})` : ""}
@@ -2288,9 +2265,9 @@ Thank you!`;
                                     setPromoCodeInput("");
                                     setShowPromoInput(false);
                                   }}
-                                  className="text-[10px] text-red-500 hover:text-red-700 underline cursor-pointer"
+                                  className="text-[10px] text-zinc-500 hover:text-red-600 underline cursor-pointer font-semibold"
                                 >
-                                  Remove
+                                  Clear
                                 </button>
                               </div>
                             )}
@@ -2359,21 +2336,26 @@ Thank you!`;
             </div>
 
             {/* Progress Bar Banner */}
-            <div className="bg-amber-500/10 border-b border-amber-500/20 px-5 py-3 shrink-0">
+            <div className="bg-[#F8F9FA] border-b border-slate-200 px-5 py-3.5 shrink-0">
               <div className="flex items-center justify-between text-xs font-bold text-zinc-900 mb-1.5">
-                <span>Carton Progress</span>
+                <span className="text-zinc-700">Carton Progress</span>
                 <span
                   className={
-                    currentMixTotalBottles === activeTargetCartonSize ? "text-emerald-600 font-extrabold" : ""
+                    currentMixTotalBottles === activeTargetCartonSize
+                      ? "text-emerald-600 font-bold"
+                      : "text-zinc-600 font-medium"
                   }
                 >
-                  {currentMixTotalBottles} / {activeTargetCartonSize} Items Selected
+                  <strong className={currentMixTotalBottles === activeTargetCartonSize ? "text-emerald-600" : "text-[#0B57D0]"}>
+                    {currentMixTotalBottles}
+                  </strong>{" "}
+                  / {activeTargetCartonSize} Items Selected
                 </span>
               </div>
-              <div className="w-full bg-slate-200 h-2.5 rounded-full overflow-hidden">
+              <div className="w-full bg-slate-200 h-2 rounded-full overflow-hidden">
                 <div
                   className={`h-full transition-all duration-300 ${
-                    currentMixTotalBottles === activeTargetCartonSize ? "bg-emerald-500" : "bg-amber-500"
+                    currentMixTotalBottles === activeTargetCartonSize ? "bg-emerald-500" : "bg-[#0B57D0]"
                   }`}
                   style={{
                     width: `${Math.min(100, (currentMixTotalBottles / activeTargetCartonSize) * 100)}%`
@@ -2419,13 +2401,8 @@ Thank you!`;
                                 />
                                 <div>
                                   <div className="font-bold text-xs text-zinc-900">{product.display_name}</div>
-                                  <div className="text-[11px] text-zinc-500 font-medium flex items-center gap-2">
-                                    <span>${product.price_per_piece.toFixed(2)} / pc</span>
-                                    {isAtSkuMax && (
-                                      <span className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.2 rounded font-bold">
-                                        Max {maxAllowedPerSku} in mix
-                                      </span>
-                                    )}
+                                  <div className="text-[11px] text-zinc-500 font-medium">
+                                    ${product.price_per_piece.toFixed(2)} / pc
                                   </div>
                                 </div>
                               </div>
@@ -2756,15 +2733,32 @@ Thank you!`;
                   </div>
 
                   {discountInfo.discountAmount > 0 && (
-                    <div className="flex justify-between text-emerald-600 font-semibold">
-                      <span>Discount ({discountInfo.ruleName}):</span>
-                      <span>-${discountInfo.discountAmount.toFixed(2)}</span>
+                    <div className="flex justify-between items-center text-zinc-600">
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span>Discount ({discountInfo.ruleName}):</span>
+                        {appliedPromoCode && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setAppliedPromoCode("");
+                              setPromoCodeInput("");
+                              setShowPromoInput(false);
+                            }}
+                            className="inline-flex items-center gap-0.5 text-[11px] font-semibold text-red-500 hover:text-red-700 underline cursor-pointer transition-colors"
+                            title="Clear promo code"
+                          >
+                            <X size={11} className="shrink-0 text-red-500" />
+                            <span>Clear</span>
+                          </button>
+                        )}
+                      </div>
+                      <span className="font-semibold text-zinc-900">-${discountInfo.discountAmount.toFixed(2)}</span>
                     </div>
                   )}
 
                   <div className="flex justify-between text-zinc-600">
                     <span>Delivery:</span>
-                    <span className={deliveryMethod === "pickup" || deliveryFee === 0 ? "text-emerald-600 font-bold" : "font-semibold text-zinc-900"}>
+                    <span className="font-semibold text-zinc-900">
                       {deliveryMethod === "pickup" ? "FREE ($0.00 - Self Pickup)" : (deliveryFee === 0 ? "FREE" : `$${deliveryFee.toFixed(2)}`)}
                     </span>
                   </div>
@@ -2853,7 +2847,7 @@ Thank you!`;
                   <div className="w-full max-w-[270px] flex items-center justify-center gap-2 py-1.5 px-3.5 bg-amber-50 border border-amber-200/90 rounded-full text-xs font-bold text-amber-900 mb-3.5 shadow-2xs">
                     <Clock size={14} className="text-amber-600 shrink-0 animate-pulse" />
                     <span>
-                      PayNow QR expires in {String(Math.floor(timeLeftSeconds / 60)).padStart(2, "0")}:{String(timeLeftSeconds % 60).padStart(2, "0")}
+                      Expires in {String(Math.floor(timeLeftSeconds / 60)).padStart(2, "0")}:{String(timeLeftSeconds % 60).padStart(2, "0")}
                     </span>
                   </div>
 
@@ -2953,15 +2947,27 @@ Thank you!`;
                   </div>
                 </div>
 
+                {/* Real-time Bank Email Status / Indicator (only shown if auto-verified by bank) */}
+                {autoVerified && (
+                  <div className="bg-emerald-50 border border-emerald-300 rounded-2xl p-3 text-xs text-emerald-800 font-bold flex items-center justify-center gap-2 shadow-xs animate-pulse">
+                    <CheckCircle2 size={16} className="text-emerald-600 shrink-0" />
+                    <span>Payment Verified by Bank! Redirecting to confirmation...</span>
+                  </div>
+                )}
+
                 {/* Action Button: I have already paid only */}
-                <div className="pt-2">
+                <div className="pt-1">
                   <button
                     type="button"
                     onClick={handleAlreadyPaid}
-                    className="w-full h-12 bg-[#25D366] hover:bg-[#20bd5a] text-white font-extrabold text-sm rounded-full flex items-center justify-center gap-2 transition-transform active:scale-98 cursor-pointer shadow-md"
+                    className={`w-full h-12 text-white font-extrabold text-sm rounded-full flex items-center justify-center gap-2 transition-transform active:scale-98 cursor-pointer shadow-md ${
+                      autoVerified
+                        ? "bg-emerald-600 hover:bg-emerald-700"
+                        : "bg-[#25D366] hover:bg-[#20bd5a]"
+                    }`}
                   >
                     <CheckCircle2 size={18} />
-                    <span>I have already paid</span>
+                    <span>{autoVerified ? "Payment Verified! Redirecting..." : "I have already paid"}</span>
                   </button>
                 </div>
 
@@ -2992,6 +2998,44 @@ Thank you!`;
               <span>⚠️ Payment session expired (5 minutes). Order was cancelled.</span>
             </div>
           )}
+        </div>
+      )}
+
+      {/* ========================================================= */}
+      {/* MODAL POPUP: PAYMENT SESSION EXPIRED                      */}
+      {/* ========================================================= */}
+      {expirePopupOpen && (
+        <div className="fixed inset-0 z-[60] bg-black/60 backdrop-blur-md flex items-center justify-center p-4 animate-in fade-in duration-200">
+          <div className="bg-white rounded-2xl max-w-sm w-full p-6 text-center border border-slate-200 shadow-2xl space-y-4 animate-in zoom-in-95 duration-200 select-none">
+            <div className="w-12 h-12 rounded-full bg-amber-50 border border-amber-200 text-amber-600 flex items-center justify-center mx-auto">
+              <Clock size={24} />
+            </div>
+
+            <div>
+              <h3 className="text-base font-extrabold text-zinc-950">Payment Session Expired</h3>
+              <p className="text-xs text-zinc-600 mt-2 leading-relaxed">
+                The 5-minute payment window has expired and this order was canceled.
+              </p>
+              <p className="text-[11px] text-zinc-400 mt-1.5">
+                Click OK to review your details and generate a fresh QR code.
+              </p>
+            </div>
+
+            <div className="pt-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setExpirePopupOpen(false);
+                  setPaymentModalOpen(false);
+                  clearPaymentSession();
+                  setCheckoutModalOpen(true);
+                }}
+                className="w-full h-10 bg-zinc-800 hover:bg-zinc-900 text-white rounded-xl text-xs font-bold transition-all cursor-pointer shadow-xs active:scale-98"
+              >
+                OK
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
