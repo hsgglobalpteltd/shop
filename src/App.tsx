@@ -63,6 +63,8 @@ interface Product {
   badge_text: string;
   product_meta: any;
   sort_order: number;
+  has_bcrs?: boolean;
+  bcrs_amount?: number;
 }
 
 interface PriceRule {
@@ -116,6 +118,7 @@ interface ShopSettings {
   pickup_hours?: string;
   allow_self_pickup?: boolean;
   show_hero_section?: boolean;
+  max_order_amount?: number;
 }
 
 // Carton Size Group for Custom Mix Builder
@@ -151,6 +154,7 @@ interface CartCarton {
   carton_group_key?: string;
   dimensions_text?: string;
   carton_pcs?: number;
+  has_bcrs?: boolean;
 }
 
 const getBrandCartonGroups = (brandIdOrBrand: string | Brand, allProducts: Product[]): CartonSizeGroup[] => {
@@ -216,6 +220,27 @@ const getBrandCartonGroups = (brandIdOrBrand: string | Brand, allProducts: Produ
   return groups;
 };
 
+// Pre-warm browser cache with full-resolution master images
+const prewarmCatalogImages = (prods: Product[]) => {
+  if (typeof window === "undefined" || !Array.isArray(prods)) return;
+  // Clear any legacy downscaled localstorage thumbnails
+  try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith("hsg_thumb_")) {
+        localStorage.removeItem(k);
+      }
+    }
+  } catch {}
+
+  prods.forEach((p) => {
+    if (p.image) {
+      const img = new Image();
+      img.src = p.image;
+    }
+  });
+};
+
 export default function App() {
   // State: Data
   const [loading, setLoading] = useState<boolean>(true);
@@ -245,6 +270,7 @@ export default function App() {
     store_person_name: "Warehouse Store Person",
     pickup_hours: "Mon - Fri: 10:00 AM - 6:00 PM",
     allow_self_pickup: true,
+    max_order_amount: 1000,
     show_hero_section: (() => {
       try {
         const cached = localStorage.getItem("hsg_show_hero_section");
@@ -277,13 +303,7 @@ export default function App() {
 
   const [cartDrawerOpen, setCartDrawerOpen] = useState<boolean>(false);
   const [promoCodeInput, setPromoCodeInput] = useState<string>("");
-  const [showPromoInput, setShowPromoInput] = useState<boolean>(() => {
-    try {
-      return Boolean(localStorage.getItem("hsg_shop_promo"));
-    } catch {
-      return false;
-    }
-  });
+  const [showPromoInput, setShowPromoInput] = useState<boolean>(false);
 
   // Persist cart changes
   useEffect(() => {
@@ -472,15 +492,6 @@ export default function App() {
   });
   const [deliveryNotes, setDeliveryNotes] = useState<string>("");
 
-  const isCheckoutFormValid = useMemo(() => {
-    const hasName = customerName.trim().length > 0;
-    const cleanPhone = phoneBody.replace(/[^0-9]/g, "");
-    const hasPhone = cleanPhone.length >= 8;
-    const isPickup = deliveryMethod === "pickup";
-    const hasAddress = isPickup || (postalCode.trim().length >= 6 && deliveryAddress.trim().length > 0);
-    return hasName && hasPhone && hasAddress && canPayNowTick;
-  }, [customerName, phoneBody, deliveryMethod, postalCode, deliveryAddress, canPayNowTick]);
-
   useEffect(() => {
     try {
       if (customerName) localStorage.setItem("hsg_customer_name", customerName);
@@ -500,9 +511,14 @@ export default function App() {
 
   // 1. Initial Load & Check URL parameters for Order Tracking
   useEffect(() => {
-    // Check if query has ?ref=HSG-XXXX or ?track=HSG-XXXX
+    // Check if query has ?ref=HSG-XXXX or ?track=HSG-XXXX or path /track/HSG-XXXX
     const params = new URLSearchParams(window.location.search);
-    const refParam = params.get("ref") || params.get("track");
+    const pathParts = window.location.pathname.split("/").filter(Boolean);
+    let pathRef = "";
+    if (pathParts[0] === "track" && pathParts[1]) {
+      pathRef = pathParts[1];
+    }
+    const refParam = params.get("ref") || params.get("track") || pathRef;
     if (refParam) {
       setTrackingOrderRef(refParam);
       loadTrackedOrder(refParam);
@@ -522,6 +538,9 @@ export default function App() {
         setBrands(data.brands || []);
         setProducts(data.products || []);
         setPriceRules(data.price_rules || []);
+        if (Array.isArray(data.products)) {
+          prewarmCatalogImages(data.products);
+        }
         if (data.settings) {
           setSettings(data.settings);
           try {
@@ -798,6 +817,35 @@ export default function App() {
     };
   }, [totalCartons, subtotal, priceRules, appliedPromoCode]);
 
+  // Product SKU Map for fast property lookup
+  const productMap = useMemo(() => {
+    const map = new Map<string, Product>();
+    products.forEach((p) => map.set(p.sku, p));
+    return map;
+  }, [products]);
+
+  // Calculate total BCRS deposit ($0.10 per eligible beverage container, 0% tax)
+  const totalBcrs = useMemo(() => {
+    let bcrs = 0;
+    for (const item of cart) {
+      if (item.carton_type === "custom_mix" && item.loose_bottles) {
+        for (const lb of item.loose_bottles) {
+          const prod = productMap.get(lb.sku);
+          if (prod?.has_bcrs) {
+            bcrs += (lb.qty || 0) * (item.carton_qty || 1) * 0.10;
+          }
+        }
+      } else if (item.sku) {
+        const prod = productMap.get(item.sku);
+        if (prod?.has_bcrs || item.has_bcrs) {
+          const pcs = Number(item.carton_pcs || prod?.carton_pcs || 24);
+          bcrs += (item.carton_qty || 1) * pcs * 0.10;
+        }
+      }
+    }
+    return Number(bcrs.toFixed(2));
+  }, [cart, productMap]);
+
   const deliveryFee = useMemo(() => {
     if (deliveryMethod === "pickup") return 0;
     const effectiveSubtotal = Math.max(0, subtotal - discountInfo.discountAmount);
@@ -809,10 +857,22 @@ export default function App() {
 
   const totalAmount = useMemo(() => {
     const effectiveSubtotal = Math.max(0, subtotal - discountInfo.discountAmount);
-    return Number((effectiveSubtotal + deliveryFee).toFixed(2));
-  }, [subtotal, discountInfo.discountAmount, deliveryFee]);
+    return Number((effectiveSubtotal + deliveryFee + totalBcrs).toFixed(2));
+  }, [subtotal, discountInfo.discountAmount, deliveryFee, totalBcrs]);
 
-  const canCheckout = totalCartons >= Number(settings.min_order_cartons || 2) && settings.is_store_open;
+  const maxOrderLimit = Number(settings.max_order_amount || 1000);
+  const isOrderExceedingLimit = totalAmount > maxOrderLimit || subtotal > maxOrderLimit;
+  const canCheckout = totalCartons >= Number(settings.min_order_cartons || 2) && !isOrderExceedingLimit && settings.is_store_open;
+
+  const isCheckoutFormValid = useMemo(() => {
+    if (isOrderExceedingLimit) return false;
+    const hasName = customerName.trim().length > 0;
+    const cleanPhone = phoneBody.replace(/[^0-9]/g, "");
+    const hasPhone = cleanPhone.length >= 8;
+    const isPickup = deliveryMethod === "pickup";
+    const hasAddress = isPickup || (postalCode.trim().length >= 6 && deliveryAddress.trim().length > 0);
+    return hasName && hasPhone && hasAddress && canPayNowTick;
+  }, [customerName, phoneBody, deliveryMethod, postalCode, deliveryAddress, canPayNowTick, isOrderExceedingLimit]);
 
   // Add Standard Carton to Cart
   const handleAddStandardCarton = (product: Product) => {
@@ -833,7 +893,9 @@ export default function App() {
             name: `${product.display_name} (${product.carton_pcs} pcs)`,
             carton_qty: 1,
             carton_price: product.carton_price,
-            price_per_piece: product.price_per_piece
+            price_per_piece: product.price_per_piece,
+            carton_pcs: product.carton_pcs,
+            has_bcrs: Boolean(product.has_bcrs)
           }
         ];
       }
@@ -996,7 +1058,8 @@ export default function App() {
         subtotal,
         discount_amount: discountInfo.discountAmount,
         applied_discount_rule: discountInfo.ruleName,
-        delivery_fee: deliveryFee
+        delivery_fee: deliveryFee,
+        total_bcrs: totalBcrs
       };
 
       const res = await fetch(`${WORKER_URL}/api/shop/orders`, {
@@ -1859,8 +1922,9 @@ Thank you!`;
                         <img
                           src={product.image}
                           alt={product.display_name}
-                          className="w-full h-full object-cover transition-transform duration-500 ease-out group-hover:scale-108 group-hover:rotate-2 transform-gpu"
+                          className="w-full h-full object-cover transition-transform duration-500 ease-out group-hover:scale-108 transform-gpu"
                           loading="lazy"
+                          decoding="async"
                         />
                       </div>
 
@@ -2142,7 +2206,7 @@ Thank you!`;
                             onClick={() => {
                               setAppliedPromoCode("");
                               setPromoCodeInput("");
-                              setShowPromoInput(false);
+                              setShowPromoInput(true);
                             }}
                             className="inline-flex items-center gap-0.5 text-[11px] font-semibold text-red-500 hover:text-red-700 underline cursor-pointer transition-colors"
                             title="Clear promo code"
@@ -2163,75 +2227,89 @@ Thank you!`;
                     </span>
                   </div>
 
+                  {totalBcrs > 0 && (
+                    <div className="flex justify-between items-center text-zinc-600">
+                      <div className="flex items-center gap-1.5">
+                        <span>BCRS:</span>
+                        <span className="text-[10px] text-zinc-400 font-medium">($0.10/beverage • Zero Tax)</span>
+                      </div>
+                      <span className="font-semibold text-zinc-900">+${totalBcrs.toFixed(2)}</span>
+                    </div>
+                  )}
+
                   <div className="flex justify-between text-base font-extrabold text-zinc-950 pt-2 border-t border-slate-200">
                     <span>Total Payable:</span>
                     <span>${totalAmount.toFixed(2)}</span>
                   </div>
 
-                  {/* Promo Code Input */}
-                  <div className="pt-2 border-t border-slate-200">
-                    {!showPromoInput && !appliedPromoCode ? (
-                      <div className="flex items-center justify-between py-1">
-                        <span className="text-xs font-bold text-zinc-800">Have a Promo Code?</span>
-                        <button
-                          type="button"
-                          onClick={() => setShowPromoInput(true)}
-                          className="h-7 px-3 bg-slate-100 hover:bg-slate-200 text-[#0B57D0] hover:text-[#0842A0] rounded-full text-xs font-bold transition-colors cursor-pointer border border-slate-200"
-                        >
-                          Yes
-                        </button>
-                      </div>
-                    ) : (
-                      <>
-                        <div className="flex items-center justify-between mb-1.5">
-                          <div className="text-xs font-bold text-zinc-800">Have a Promo Code?</div>
-                          {!appliedPromoCode && (
+                  {/* Promo Code Input: Hidden when a valid promo is applied; shows when cleared or requested */}
+                  {appliedPromoCode && !discountInfo.promoError ? null : (
+                    <div className="pt-2 border-t border-slate-200">
+                      {!showPromoInput && !appliedPromoCode ? (
+                        <div className="flex items-center justify-between py-1">
+                          <span className="text-xs font-bold text-zinc-800">Have a Promo Code?</span>
+                          <button
+                            type="button"
+                            onClick={() => setShowPromoInput(true)}
+                            className="h-7 px-3 bg-slate-100 hover:bg-slate-200 text-[#0B57D0] hover:text-[#0842A0] rounded-full text-xs font-bold transition-colors cursor-pointer border border-slate-200"
+                          >
+                            Yes
+                          </button>
+                        </div>
+                      ) : (
+                        <>
+                          <div className="flex items-center justify-between mb-1.5">
+                            <div className="text-xs font-bold text-zinc-800">Have a Promo Code?</div>
                             <button
                               type="button"
                               onClick={() => {
                                 setShowPromoInput(false);
                                 setPromoCodeInput("");
+                                setAppliedPromoCode("");
                               }}
                               className="text-[10px] text-zinc-400 hover:text-zinc-600 underline cursor-pointer"
                             >
                               Cancel
                             </button>
-                          )}
-                        </div>
-                        <div className="flex gap-2">
-                          <div className="relative flex-1">
-                            <input
-                              type="text"
-                              placeholder="EG : HSGGLOBAL"
-                              value={promoCodeInput}
-                              onChange={(e) => setPromoCodeInput(e.target.value.toUpperCase())}
-                              className="w-full pl-3.5 pr-8 py-2 bg-white border border-slate-300 rounded-xl text-xs font-mono font-bold uppercase focus:ring-1 focus:ring-[#0B57D0]"
-                              autoFocus
-                            />
-                            {promoCodeInput && (
-                              <button
-                                type="button"
-                                onClick={() => setPromoCodeInput("")}
-                                className="absolute right-2 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600 p-1 cursor-pointer"
-                                title="Clear input text"
-                              >
-                                <X size={13} />
-                              </button>
-                            )}
                           </div>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setAppliedPromoCode(promoCodeInput.trim());
-                            }}
-                            className="px-4 bg-zinc-950 hover:bg-zinc-800 text-white rounded-xl text-xs font-bold cursor-pointer transition-colors"
-                          >
-                            Apply
-                          </button>
-                        </div>
-                        {appliedPromoCode && (
-                          <div className="mt-2 space-y-1">
-                            {discountInfo.promoError ? (
+                          <div className="flex gap-2">
+                            <div className="relative flex-1">
+                              <input
+                                type="text"
+                                placeholder="EG : HSGGLOBAL"
+                                value={promoCodeInput}
+                                onChange={(e) => setPromoCodeInput(e.target.value.toUpperCase())}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter" && promoCodeInput.trim()) {
+                                    setAppliedPromoCode(promoCodeInput.trim());
+                                  }
+                                }}
+                                className="w-full pl-3.5 pr-8 py-2 bg-white border border-slate-300 rounded-xl text-xs font-mono font-bold uppercase focus:ring-1 focus:ring-[#0B57D0]"
+                                autoFocus
+                              />
+                              {promoCodeInput && (
+                                <button
+                                  type="button"
+                                  onClick={() => setPromoCodeInput("")}
+                                  className="absolute right-2 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600 p-1 cursor-pointer"
+                                  title="Clear input text"
+                                >
+                                  <X size={13} />
+                                </button>
+                              )}
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setAppliedPromoCode(promoCodeInput.trim());
+                              }}
+                              className="px-4 bg-zinc-950 hover:bg-zinc-800 text-white rounded-xl text-xs font-bold cursor-pointer transition-colors"
+                            >
+                              Apply
+                            </button>
+                          </div>
+                          {appliedPromoCode && discountInfo.promoError && (
+                            <div className="mt-2 space-y-1">
                               <div className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded-lg p-2.5 flex items-start justify-between gap-2">
                                 <div className="flex items-start gap-1.5">
                                   <AlertCircle size={14} className="shrink-0 mt-0.5 text-amber-600" />
@@ -2242,44 +2320,43 @@ Thank you!`;
                                   onClick={() => {
                                     setAppliedPromoCode("");
                                     setPromoCodeInput("");
-                                    setShowPromoInput(false);
                                   }}
                                   className="text-[10px] text-zinc-500 hover:text-zinc-800 underline shrink-0 cursor-pointer"
                                 >
                                   Clear
                                 </button>
                               </div>
-                            ) : (
-                              <div className="text-[11px] text-zinc-700 bg-slate-100 border border-slate-200 rounded-lg p-2.5 flex items-center justify-between">
-                                <div className="flex items-center gap-1.5">
-                                  <CheckCircle2 size={13} className="text-[#0B57D0] shrink-0" />
-                                  <span>
-                                    Applied <strong>{appliedPromoCode}</strong>
-                                    {discountInfo.promoDesc ? ` (${discountInfo.promoDesc})` : ""}
-                                  </span>
-                                </div>
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setAppliedPromoCode("");
-                                    setPromoCodeInput("");
-                                    setShowPromoInput(false);
-                                  }}
-                                  className="text-[10px] text-zinc-500 hover:text-red-600 underline cursor-pointer font-semibold"
-                                >
-                                  Clear
-                                </button>
-                              </div>
-                            )}
-                          </div>
-                        )}
-                      </>
-                    )}
-                  </div>
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  )}
 
                   {/* Minimum Cartons Checker / Proceed Button */}
                   <div className="pt-2">
-                    {!canCheckout ? (
+                    {isOrderExceedingLimit ? (
+                      <div className="bg-amber-50 border border-amber-300 rounded-2xl p-4 text-xs space-y-2.5 shadow-2xs">
+                        <div className="flex items-start gap-2 text-amber-900 font-bold">
+                          <AlertCircle size={16} className="text-amber-600 shrink-0 mt-0.5" />
+                          <span>Bulk Order Limit Reached (${maxOrderLimit.toLocaleString()})</span>
+                        </div>
+                        <p className="text-amber-800 leading-relaxed text-[11px]">
+                          Orders exceeding <strong>${maxOrderLimit.toLocaleString()}</strong> qualify for special volume pricing and bulk distributor discounts! Please contact our sales team on WhatsApp to receive a special price quotation.
+                        </p>
+                        <a
+                          href={`https://wa.me/${(settings.whatsapp_number || "+65 80892248").replace(/\D/g, "")}?text=${encodeURIComponent(
+                            `Hi HSG Global, I have an order of ${totalCartons} cartons ($${totalAmount.toFixed(2)}) and would like to request special bulk pricing.`
+                          )}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="w-full h-11 bg-[#25D366] hover:bg-[#20bd5a] text-white font-bold text-xs rounded-xl flex items-center justify-center gap-2 transition-transform active:scale-98 cursor-pointer shadow-xs"
+                        >
+                          <MessageSquare size={15} />
+                          <span>Contact Sales for Special Price</span>
+                        </a>
+                      </div>
+                    ) : !canCheckout ? (
                       <div className="bg-amber-100 text-amber-900 p-3 rounded-xl text-center text-xs font-bold">
                         ⚠️ Order minimum is {settings.min_order_cartons} cartons. Please add{" "}
                         {Number(settings.min_order_cartons || 2) - totalCartons} more carton to unlock checkout.
@@ -2398,6 +2475,8 @@ Thank you!`;
                                   src={product.image}
                                   alt={product.display_name}
                                   className="w-10 h-10 object-contain rounded bg-white border border-slate-200"
+                                  loading="lazy"
+                                  decoding="async"
                                 />
                                 <div>
                                   <div className="font-bold text-xs text-zinc-900">{product.display_name}</div>
@@ -2559,7 +2638,7 @@ Thank you!`;
                         </div>
                         {deliveryMethod === "pickup" && <Check size={14} className="text-[#0B57D0]" />}
                       </div>
-                      <span className="text-[11px] text-emerald-600 font-bold">FREE ($0.00) • Eunos</span>
+                      <span className="text-[11px] text-zinc-500">FREE ($0.00) • Eunos</span>
                     </button>
                   </div>
                 </div>
@@ -2742,7 +2821,7 @@ Thank you!`;
                             onClick={() => {
                               setAppliedPromoCode("");
                               setPromoCodeInput("");
-                              setShowPromoInput(false);
+                              setShowPromoInput(true);
                             }}
                             className="inline-flex items-center gap-0.5 text-[11px] font-semibold text-red-500 hover:text-red-700 underline cursor-pointer transition-colors"
                             title="Clear promo code"
@@ -2763,35 +2842,72 @@ Thank you!`;
                     </span>
                   </div>
 
+                  {totalBcrs > 0 && (
+                    <div className="flex justify-between items-center text-zinc-600">
+                      <div className="flex items-center gap-1.5">
+                        <span>BCRS:</span>
+                        <span className="text-[10px] text-zinc-400 font-medium">($0.10/beverage • Zero Tax)</span>
+                      </div>
+                      <span className="font-semibold text-zinc-900">+${totalBcrs.toFixed(2)}</span>
+                    </div>
+                  )}
+
                   <div className="flex justify-between text-base font-extrabold text-zinc-950 pt-2 border-t border-slate-200">
                     <span>Total to Pay via SGQR:</span>
                     <span>${totalAmount.toFixed(2)}</span>
                   </div>
 
-                  {/* Readiness Confirmation Tick */}
-                  <div className="pt-2 border-t border-slate-200">
-                    <label className="flex items-start gap-2.5 cursor-pointer select-none p-2.5 rounded-xl bg-white border border-slate-200 hover:border-slate-300 transition-colors">
-                      <input
-                        type="checkbox"
-                        checked={canPayNowTick}
-                        onChange={(e) => setCanPayNowTick(e.target.checked)}
-                        className="mt-0.5 w-4 h-4 rounded border-slate-300 text-[#0B57D0] focus:ring-[#0B57D0] cursor-pointer shrink-0 accent-[#0B57D0]"
-                      />
-                      <span className="text-xs text-zinc-800 font-medium leading-snug">
-                        I confirm that I am able to pay via <strong>PayNow QR code</strong> now.
-                      </span>
-                    </label>
-                  </div>
+                  {isOrderExceedingLimit ? (
+                    <div className="pt-2 border-t border-slate-200">
+                      <div className="bg-amber-50 border border-amber-300 rounded-2xl p-4 text-xs space-y-2.5 shadow-2xs">
+                        <div className="flex items-start gap-2 text-amber-900 font-bold">
+                          <AlertCircle size={16} className="text-amber-600 shrink-0 mt-0.5" />
+                          <span>Bulk Order Limit Reached (${maxOrderLimit.toLocaleString()})</span>
+                        </div>
+                        <p className="text-amber-800 leading-relaxed text-[11px]">
+                          Orders exceeding <strong>${maxOrderLimit.toLocaleString()}</strong> qualify for special volume pricing and custom distributor discounts. Please contact our corporate sales team on WhatsApp to place your order with special pricing.
+                        </p>
+                        <a
+                          href={`https://wa.me/${(settings.whatsapp_number || "+65 80892248").replace(/\D/g, "")}?text=${encodeURIComponent(
+                            `Hi HSG Global, I have an order of ${totalCartons} cartons ($${totalAmount.toFixed(2)}) and would like to request special bulk pricing.`
+                          )}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="w-full h-11 bg-[#25D366] hover:bg-[#20bd5a] text-white font-bold text-xs rounded-xl flex items-center justify-center gap-2 transition-transform active:scale-98 cursor-pointer shadow-xs"
+                        >
+                          <MessageSquare size={15} />
+                          <span>Contact Sales for Special Price</span>
+                        </a>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      {/* Readiness Confirmation Tick */}
+                      <div className="pt-2 border-t border-slate-200">
+                        <label className="flex items-start gap-2.5 cursor-pointer select-none p-2.5 rounded-xl bg-white border border-slate-200 hover:border-slate-300 transition-colors">
+                          <input
+                            type="checkbox"
+                            checked={canPayNowTick}
+                            onChange={(e) => setCanPayNowTick(e.target.checked)}
+                            className="mt-0.5 w-4 h-4 rounded border-slate-300 text-[#0B57D0] focus:ring-[#0B57D0] cursor-pointer shrink-0 accent-[#0B57D0]"
+                          />
+                          <span className="text-xs text-zinc-800 font-medium leading-snug">
+                            I confirm that I am able to pay via <strong>PayNow QR code</strong> now.
+                          </span>
+                        </label>
+                      </div>
 
-                  <div className="pt-2">
-                    <button
-                      type="submit"
-                      disabled={isSubmittingOrder || !isCheckoutFormValid}
-                      className="w-full h-12 bg-[#0B57D0] hover:bg-[#0842A0] text-white font-bold text-sm rounded-xl flex items-center justify-center gap-2 transition-transform active:scale-98 cursor-pointer shadow-md disabled:opacity-40 disabled:cursor-not-allowed"
-                    >
-                      {isSubmittingOrder ? "Preparing SGQR..." : "Continue Payment"}
-                    </button>
-                  </div>
+                      <div className="pt-2">
+                        <button
+                          type="submit"
+                          disabled={isSubmittingOrder || !isCheckoutFormValid}
+                          className="w-full h-12 bg-[#0B57D0] hover:bg-[#0842A0] text-white font-bold text-sm rounded-xl flex items-center justify-center gap-2 transition-transform active:scale-98 cursor-pointer shadow-md disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          {isSubmittingOrder ? "Preparing SGQR..." : "Continue Payment"}
+                        </button>
+                      </div>
+                    </>
+                  )}
                 </div>
 
                 <div className="bg-blue-50/60 border border-blue-200/60 rounded-xl p-3 text-[11px] text-zinc-600 flex items-start gap-2">
