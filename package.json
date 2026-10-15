@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@lottiefiles/dotlottie-react": "^0.20.0",
     "html-to-image": "^1.11.11",
     "lucide-react": "^1.16.0",
     "qrcode.react": "^4.2.0",
