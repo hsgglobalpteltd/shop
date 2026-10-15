@@ -506,8 +506,143 @@ export default function App() {
     }
   }, [customerName, phoneCountryCode, customerPhone, customerEmail, postalCode, deliveryAddress, unitNo]);
 
-  // Policy Modals
+  // Policy Modals & Simple URL Routing (/policy, /tnc)
   const [policyModal, setPolicyModal] = useState<"terms" | "refund" | null>(null);
+  const [currentPath, setCurrentPath] = useState<string>(() => {
+    try {
+      return window.location.pathname.toLowerCase().replace(/\/$/, "");
+    } catch {
+      return "";
+    }
+  });
+
+  const navigateTo = (path: string) => {
+    try {
+      window.history.pushState(null, "", path);
+      setCurrentPath(path.toLowerCase().replace(/\/$/, ""));
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } catch {
+      window.location.href = path;
+    }
+  };
+
+  useEffect(() => {
+    const handlePopState = () => {
+      setCurrentPath(window.location.pathname.toLowerCase().replace(/\/$/, ""));
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
+
+  const isPolicyRoute = currentPath === "/policy" || currentPath === "/privacy" || currentPath === "/privacy-policy";
+  const isTncRoute = currentPath === "/tnc" || currentPath === "/terms" || currentPath === "/terms-and-conditions";
+
+  // WhatsApp Customer Auth & Order History States
+  const [authCustomerPhone, setAuthCustomerPhone] = useState<string>(() => {
+    try { return localStorage.getItem("hsg_auth_phone") || ""; } catch { return ""; }
+  });
+  const [authCustomerName, setAuthCustomerName] = useState<string>(() => {
+    try { return localStorage.getItem("hsg_auth_name") || ""; } catch { return ""; }
+  });
+  const [loginModalOpen, setLoginModalOpen] = useState<boolean>(false);
+  const [loginSession, setLoginSession] = useState<any | null>(null);
+  const [loginLoading, setLoginLoading] = useState<boolean>(false);
+  const [orderHistoryModalOpen, setOrderHistoryModalOpen] = useState<boolean>(false);
+  const [pastOrders, setPastOrders] = useState<any[]>([]);
+  const [pastOrdersLoading, setPastOrdersLoading] = useState<boolean>(false);
+  const [authCopied, setAuthCopied] = useState<boolean>(false);
+
+  const handleOpenLogin = async () => {
+    setLoginLoading(true);
+    setLoginModalOpen(true);
+    try {
+      const res = await fetch(`${WORKER_URL}/api/shop/auth/whatsapp/init`, { method: "POST" });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success) {
+          setLoginSession(data);
+        }
+      }
+    } catch (err) {
+      console.error("Auth init failed", err);
+    } finally {
+      setLoginLoading(false);
+    }
+  };
+
+  const fetchPastOrders = async (phone: string) => {
+    setPastOrdersLoading(true);
+    try {
+      const res = await fetch(`${WORKER_URL}/api/shop/customer/orders?phone=${encodeURIComponent(phone)}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success) {
+          setPastOrders(data.orders || []);
+        }
+      }
+    } catch (err) {
+      console.error("Fetch past orders failed", err);
+    } finally {
+      setPastOrdersLoading(false);
+    }
+  };
+
+  const handleLogout = () => {
+    setAuthCustomerPhone("");
+    setAuthCustomerName("");
+    try {
+      localStorage.removeItem("hsg_auth_phone");
+      localStorage.removeItem("hsg_auth_name");
+    } catch (e) {}
+    setOrderHistoryModalOpen(false);
+  };
+
+  // Real-time WhatsApp Inbound Webhook Polling
+  useEffect(() => {
+    if (!loginModalOpen || !loginSession?.session_id) return;
+    let isMounted = true;
+
+    const pollTimer = setInterval(async () => {
+      try {
+        const res = await fetch(
+          `${WORKER_URL}/api/shop/auth/whatsapp/poll?session_id=${encodeURIComponent(loginSession.session_id)}`
+        );
+        if (res.ok) {
+          const data = await res.json();
+          if (data.status === "verified" && isMounted) {
+            clearInterval(pollTimer);
+            const verifiedPhone = data.customer_phone;
+            const verifiedName = data.customer_name || "";
+            setAuthCustomerPhone(verifiedPhone);
+            setAuthCustomerName(verifiedName);
+            try {
+              localStorage.setItem("hsg_auth_phone", verifiedPhone);
+              if (verifiedName) localStorage.setItem("hsg_auth_name", verifiedName);
+              if (!phoneBody) {
+                const cleanBody = verifiedPhone.replace(/^\+?65/, "");
+                setPhoneBody(cleanBody);
+              }
+              if (!customerName && verifiedName) {
+                setCustomerName(verifiedName);
+              }
+            } catch (e) {}
+
+            setLoginModalOpen(false);
+            setLoginSession(null);
+            setOrderHistoryModalOpen(true);
+            fetchPastOrders(verifiedPhone);
+          }
+        }
+      } catch (err) {
+        // ignore network error
+      }
+    }, 2000);
+
+    return () => {
+      isMounted = false;
+      clearInterval(pollTimer);
+    };
+  }, [loginModalOpen, loginSession, phoneBody, customerName]);
 
   // 1. Initial Load & Check URL parameters for Order Tracking
   useEffect(() => {
@@ -1263,7 +1398,7 @@ export default function App() {
       {/* ========================================================= */}
       {/* TOP ANNOUNCEMENT BAR & GLOBAL NAVBAR                      */}
       {/* ========================================================= */}
-      {!trackedOrder && (
+      {!trackedOrder && !isPolicyRoute && !isTncRoute && (
         <>
           <div
             className={`px-4 py-2 text-center text-xs font-bold transition-all ${
@@ -1368,9 +1503,166 @@ export default function App() {
       )}
 
       {/* ========================================================= */}
-      {/* TRACKING SCREEN VIEW (IF ACTIVE)                          */}
+      {/* PRIVACY POLICY VIEW (/policy)                             */}
       {/* ========================================================= */}
-      {trackedOrder ? (() => {
+      {isPolicyRoute ? (
+        <div className="flex-1 flex flex-col min-h-screen bg-[#F8F9FA] font-primary">
+          <div className="sticky top-0 z-20 bg-white/95 backdrop-blur-xs border-b border-slate-200 py-3.5 px-4 shadow-2xs">
+            <div className="max-w-5xl mx-auto px-4 flex flex-col items-center justify-center text-center">
+              <button
+                type="button"
+                onClick={() => navigateTo("/")}
+                className="h-8 px-4 rounded-full inline-flex items-center gap-1.5 text-xs font-bold text-zinc-700 bg-slate-100 hover:bg-slate-200 active:scale-98 transition-all cursor-pointer shadow-xs select-none shrink-0 mb-2"
+              >
+                <ArrowLeft size={14} className="text-zinc-600 shrink-0" />
+                <span>Back to Storefront</span>
+              </button>
+              <h3 className="text-base font-extrabold text-zinc-950">Privacy Policy</h3>
+              <p className="text-[11px] text-zinc-500">
+                HSG GLOBAL PTE. LTD. • Official Singapore Wholesale Platform
+              </p>
+            </div>
+          </div>
+
+          <div className="max-w-3xl mx-auto px-4 py-8 flex-1 w-full">
+            <div className="bg-white rounded-2xl border border-slate-200 p-6 sm:p-8 shadow-xs space-y-6 text-xs text-zinc-700 leading-relaxed">
+              <div className="border-b border-slate-100 pb-4">
+                <h1 className="text-xl font-black text-zinc-950">Privacy Policy</h1>
+                <p className="text-xs text-zinc-400 mt-1">Last Updated: October 2026 • Effective Immediately</p>
+              </div>
+
+              <section className="space-y-2">
+                <h2 className="text-sm font-bold text-zinc-900">1. Overview</h2>
+                <p>
+                  HSG Global Pte. Ltd. ("we", "our", or "us", UEN: 201627632D) operates <strong>shop.hsgglobal.sg</strong>. We respect your privacy and are committed to safeguarding personal data in compliance with the Singapore Personal Data Protection Act (PDPA).
+                </p>
+              </section>
+
+              <section className="space-y-2">
+                <h2 className="text-sm font-bold text-zinc-900">2. Information We Collect</h2>
+                <p>When you browse, order, or authenticate on our storefront, we collect:</p>
+                <ul className="list-disc pl-5 space-y-1.5 text-zinc-600">
+                  <li><strong>Contact Details:</strong> Customer name, delivery address, postal code, phone number, and optional email address.</li>
+                  <li><strong>Wholesale Order Data:</strong> Selected brand beverages, carton quantities, order references, and delivery notes.</li>
+                  <li><strong>Payment Verification:</strong> PayNow transaction references and bank transfer snapshots. We do not store credit card or banking credentials.</li>
+                  <li><strong>WhatsApp Authentication:</strong> Mobile phone numbers and 6-digit one-time verification codes sent via WhatsApp Cloud API for order history lookup.</li>
+                </ul>
+              </section>
+
+              <section className="space-y-2">
+                <h2 className="text-sm font-bold text-zinc-900">3. Purpose of Processing</h2>
+                <ul className="list-disc pl-5 space-y-1.5 text-zinc-600">
+                  <li>Processing, packing, and dispatching wholesale carton shipments to your address or warehouse self-pickup.</li>
+                  <li>Verifying PayNow SGQR bank transfers and issuing digital order receipts.</li>
+                  <li>Providing real-time order tracking updates and automated passwordless login via WhatsApp.</li>
+                  <li>Customer service support and addressing delivery inquiries or quality claims.</li>
+                </ul>
+              </section>
+
+              <section className="space-y-2">
+                <h2 className="text-sm font-bold text-zinc-900">4. Data Sharing & Protection</h2>
+                <p>
+                  We never sell or rent your personal information to third parties. Customer details are shared strictly with authorized logistics and warehouse staff solely for order fulfillment, or when required by Singapore regulatory authorities.
+                </p>
+              </section>
+
+              <section className="space-y-2">
+                <h2 className="text-sm font-bold text-zinc-900">5. Data Retention & Your Rights</h2>
+                <p>
+                  Personal data is retained strictly as necessary to comply with legal, tax, and order fulfillment obligations. You have the right to request access to or correction of your personal data by contacting us.
+                </p>
+              </section>
+
+              <section className="space-y-2">
+                <h2 className="text-sm font-bold text-zinc-900">6. Contact Us</h2>
+                <p>For any privacy or data-related inquiries, reach us at:</p>
+                <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 space-y-1 text-zinc-700">
+                  <div className="font-bold text-zinc-900">HSG GLOBAL PTE. LTD.</div>
+                  <div>UEN: 201627632D</div>
+                  <div>Warehouse: 9 Eunos Ave 8A, Eunos Industrial Estate, Singapore 409461</div>
+                  <div>Official Support WhatsApp: +65 8475 5948</div>
+                  <div>Email: sales@hsg-global.com</div>
+                </div>
+              </section>
+            </div>
+          </div>
+        </div>
+      ) : isTncRoute ? (
+        <div className="flex-1 flex flex-col min-h-screen bg-[#F8F9FA] font-primary">
+          <div className="sticky top-0 z-20 bg-white/95 backdrop-blur-xs border-b border-slate-200 py-3.5 px-4 shadow-2xs">
+            <div className="max-w-5xl mx-auto px-4 flex flex-col items-center justify-center text-center">
+              <button
+                type="button"
+                onClick={() => navigateTo("/")}
+                className="h-8 px-4 rounded-full inline-flex items-center gap-1.5 text-xs font-bold text-zinc-700 bg-slate-100 hover:bg-slate-200 active:scale-98 transition-all cursor-pointer shadow-xs select-none shrink-0 mb-2"
+              >
+                <ArrowLeft size={14} className="text-zinc-600 shrink-0" />
+                <span>Back to Storefront</span>
+              </button>
+              <h3 className="text-base font-extrabold text-zinc-950">Terms & Conditions</h3>
+              <p className="text-[11px] text-zinc-500">
+                HSG GLOBAL PTE. LTD. • Official Singapore Wholesale Platform
+              </p>
+            </div>
+          </div>
+
+          <div className="max-w-3xl mx-auto px-4 py-8 flex-1 w-full">
+            <div className="bg-white rounded-2xl border border-slate-200 p-6 sm:p-8 shadow-xs space-y-6 text-xs text-zinc-700 leading-relaxed">
+              <div className="border-b border-slate-100 pb-4">
+                <h1 className="text-xl font-black text-zinc-950">Terms & Conditions</h1>
+                <p className="text-xs text-zinc-400 mt-1">Last Updated: October 2026 • Governed under Singapore Law</p>
+              </div>
+
+              <section className="space-y-2">
+                <h2 className="text-sm font-bold text-zinc-900">1. Acceptance of Terms</h2>
+                <p>
+                  By accessing <strong>shop.hsgglobal.sg</strong> and placing wholesale carton orders, you agree to be bound by these Terms and Conditions. These terms govern all sales and deliveries provided by HSG Global Pte. Ltd. (UEN: 201627632D).
+                </p>
+              </section>
+
+              <section className="space-y-2">
+                <h2 className="text-sm font-bold text-zinc-900">2. Wholesale Carton Ordering & MOQ</h2>
+                <ul className="list-disc pl-5 space-y-1.5 text-zinc-600">
+                  <li><strong>Minimum Order Quantity:</strong> A minimum requirement of 2 cartons per order applies across all brands.</li>
+                  <li><strong>Custom Mixed Cartons:</strong> Loose bottle custom carton mixes must match the exact bottle capacity specified for each carton size group (e.g., 24 bottles per carton).</li>
+                  <li>All orders are subject to inventory availability at our Singapore warehouse.</li>
+                </ul>
+              </section>
+
+              <section className="space-y-2">
+                <h2 className="text-sm font-bold text-zinc-900">3. Pricing & PayNow Payments</h2>
+                <ul className="list-disc pl-5 space-y-1.5 text-zinc-600">
+                  <li>All prices are in Singapore Dollars (SGD).</li>
+                  <li>Payments are verified via Singapore PayNow SGQR to UEN <strong>201627632D</strong> (HSG GLOBAL PTE LTD).</li>
+                  <li>Orders will be packed and dispatched once the PayNow transfer reference is verified.</li>
+                </ul>
+              </section>
+
+              <section className="space-y-2">
+                <h2 className="text-sm font-bold text-zinc-900">4. Delivery & Self-Pickup</h2>
+                <ul className="list-disc pl-5 space-y-1.5 text-zinc-600">
+                  <li><strong>Doorstep Delivery:</strong> Standard delivery across mainland Singapore within 2 to 3 business days. Free delivery applies above the specified order amount.</li>
+                  <li><strong>Warehouse Pickup:</strong> Free self-pickup is available at 9 Eunos Ave 8A, Singapore 409461 (Mon-Fri 10am - 6pm) once the order status is updated to ready.</li>
+                </ul>
+              </section>
+
+              <section className="space-y-2">
+                <h2 className="text-sm font-bold text-zinc-900">5. Refunds & Damaged Goods Policy</h2>
+                <p>
+                  Due to the nature of wholesale beverage distribution, orders are non-refundable once dispatched. Any transit damage or manufacturer defect must be reported within 24 hours of delivery via WhatsApp (+65 8475 5948) with photo proof for prompt replacement.
+                </p>
+              </section>
+
+              <section className="space-y-2">
+                <h2 className="text-sm font-bold text-zinc-900">6. Governing Law</h2>
+                <p>
+                  These Terms are governed by and construed in accordance with the laws of the Republic of Singapore.
+                </p>
+              </section>
+            </div>
+          </div>
+        </div>
+      ) : trackedOrder ? (() => {
         const isVerified = trackedOrder.payment_status === "verified";
         const isPickup = trackedOrder.delivery_address?.toLowerCase().includes("self-pickup");
         const trackingUrl = `${window.location.origin}/?track=${trackedOrder.order_ref}`;
@@ -3160,29 +3452,397 @@ Thank you!`;
       {/* ========================================================= */}
       {!trackedOrder && (
         <footer className="bg-white border-t border-slate-200 py-10 mt-auto">
-          <div className="max-w-6xl mx-auto px-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-6 text-xs text-zinc-500">
+          <div className="max-w-6xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-6 text-xs text-zinc-500 text-center sm:text-left">
             <div>
               <div className="font-extrabold text-sm text-zinc-900">{settings.company_name}</div>
               <div className="mt-1">UEN: {settings.company_uen} • Official Singapore Distribution</div>
-              <div className="mt-0.5">Support WhatsApp: {settings.whatsapp_number} • {settings.support_email}</div>
+              <div className="mt-0.5">Support WhatsApp: +65 8475 5948 • {settings.support_email}</div>
             </div>
 
-            <div className="flex flex-wrap items-center gap-4">
-              <button
-                onClick={() => setPolicyModal("terms")}
-                className="hover:text-zinc-900 underline underline-offset-2 cursor-pointer"
-              >
-                Delivery Policy
-              </button>
-              <button
-                onClick={() => setPolicyModal("refund")}
-                className="hover:text-zinc-900 underline underline-offset-2 cursor-pointer"
-              >
-                Refund Terms
-              </button>
+            <div className="flex flex-col sm:flex-row items-center gap-4 w-full sm:w-auto justify-center">
+              <div className="flex flex-wrap items-center justify-center gap-3 sm:gap-4">
+                <button
+                  onClick={() => setPolicyModal("terms")}
+                  className="hover:text-zinc-900 underline underline-offset-2 cursor-pointer"
+                >
+                  Delivery Policy
+                </button>
+                <button
+                  onClick={() => setPolicyModal("refund")}
+                  className="hover:text-zinc-900 underline underline-offset-2 cursor-pointer"
+                >
+                  Refund Terms
+                </button>
+                <button
+                  onClick={() => navigateTo("/policy")}
+                  className="hover:text-zinc-900 underline underline-offset-2 cursor-pointer font-medium"
+                >
+                  Privacy Policy
+                </button>
+                <button
+                  onClick={() => navigateTo("/tnc")}
+                  className="hover:text-zinc-900 underline underline-offset-2 cursor-pointer font-medium"
+                >
+                  Terms & Conditions
+                </button>
+              </div>
+
+              <span className="text-zinc-300 hidden sm:inline">|</span>
+
+              {/* Order History Footer Button - Bottom Center on Mobile */}
+              <div className="flex justify-center w-full sm:w-auto">
+                {!authCustomerPhone ? (
+                  <button
+                    onClick={handleOpenLogin}
+                    className="inline-flex items-center justify-center gap-2 px-4 py-2 bg-slate-100 hover:bg-slate-200/80 text-zinc-800 hover:text-zinc-950 border border-slate-200 rounded-lg text-xs font-bold transition-all shadow-2xs cursor-pointer active:scale-95"
+                  >
+                    <Package size={14} className="text-zinc-600" />
+                    Order History
+                  </button>
+                ) : (
+                  <div className="flex items-center gap-2 bg-slate-100 border border-slate-200 rounded-lg px-3 py-1.5">
+                    <button
+                      onClick={() => {
+                        setOrderHistoryModalOpen(true);
+                        fetchPastOrders(authCustomerPhone);
+                      }}
+                      className="inline-flex items-center gap-1.5 text-xs font-bold text-zinc-800 hover:text-zinc-950 cursor-pointer"
+                    >
+                      <Package size={13} className="text-zinc-600" />
+                      Orders ({authCustomerPhone.startsWith("65") ? `+65 ${authCustomerPhone.slice(2)}` : authCustomerPhone})
+                    </button>
+                    <span className="text-slate-300">|</span>
+                    <button
+                      onClick={handleLogout}
+                      className="text-[11px] text-zinc-500 hover:text-zinc-800 underline cursor-pointer"
+                    >
+                      Log out
+                    </button>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         </footer>
+      )}
+
+      {/* ========================================================= */}
+      {/* WHATSAPP PASSWORDLESS LOGIN MODAL                          */}
+      {/* ========================================================= */}
+      {loginModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4 animate-in fade-in duration-150">
+          <div className="bg-white rounded-2xl border border-slate-200 max-w-md w-full shadow-2xl overflow-hidden animate-in zoom-in-95 duration-150">
+            {/* Modal Header */}
+            <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0">
+                  <MessageSquare size={16} />
+                </div>
+                <div>
+                  <h3 className="font-bold text-sm text-zinc-950">Login with WhatsApp</h3>
+                  <p className="text-[11px] text-zinc-500">Access your past orders & receipts instantly</p>
+                </div>
+              </div>
+              <button
+                onClick={() => {
+                  setLoginModalOpen(false);
+                  setLoginSession(null);
+                }}
+                className="w-7 h-7 rounded-lg hover:bg-slate-100 flex items-center justify-center text-zinc-400 hover:text-zinc-700 transition-colors cursor-pointer"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            {/* Modal Content */}
+            <div className="p-5">
+              {loginLoading || !loginSession ? (
+                <div className="py-12 flex flex-col items-center justify-center text-center">
+                  <RefreshCw size={24} className="animate-spin text-emerald-600 mb-3" />
+                  <p className="text-xs font-semibold text-zinc-700">Connecting to WhatsApp service...</p>
+                </div>
+              ) : (() => {
+                const targetPhone = loginSession.target_whatsapp_phone || "6584755948";
+                const displayPhone = loginSession.target_whatsapp_display || "+65 8475 5948";
+                const waText = encodeURIComponent(loginSession.prefilled_message || `Login: ${loginSession.auth_code}`);
+                const waMobileUrl = `https://wa.me/${targetPhone}?text=${waText}`;
+                const waWebUrl = `https://web.whatsapp.com/send?phone=${targetPhone}&text=${waText}`;
+
+                return (
+                  <div className="space-y-4">
+                    {/* Instructions Banner */}
+                    <div className="bg-emerald-50/70 border border-emerald-200/60 rounded-xl p-3 text-center">
+                      <p className="text-xs text-emerald-950 font-medium">
+                        Send the one-time code below to our official WhatsApp <strong className="font-mono text-emerald-800">{displayPhone}</strong>.
+                      </p>
+                      <p className="text-[11px] text-emerald-700 mt-0.5">
+                        Your browser will auto-detect when it's sent and log you in automatically!
+                      </p>
+                    </div>
+
+                    {/* Auth Code Capsule */}
+                    <div className="bg-[#F8F9FA] border border-slate-200 rounded-xl p-3 flex items-center justify-between">
+                      <div>
+                        <div className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider">Your Login Code</div>
+                        <div className="text-lg font-black font-mono tracking-wider text-zinc-950 mt-0.5">
+                          {loginSession.auth_code}
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => {
+                          navigator.clipboard.writeText(loginSession.auth_code);
+                          setAuthCopied(true);
+                          setTimeout(() => setAuthCopied(false), 2000);
+                        }}
+                        className="px-2.5 py-1.5 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg text-xs font-bold text-zinc-700 flex items-center gap-1.5 cursor-pointer shadow-2xs"
+                      >
+                        {authCopied ? (
+                          <>
+                            <Check size={13} className="text-emerald-600" />
+                            <span className="text-emerald-600">Copied</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy size={13} />
+                            <span>Copy</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+
+                    {/* Mobile: Direct Open WhatsApp Button */}
+                    <div className="block sm:hidden">
+                      <a
+                        href={waMobileUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="w-full h-11 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold text-xs flex items-center justify-center gap-2 shadow-xs transition-colors"
+                      >
+                        <MessageSquare size={16} className="fill-white/20" />
+                        Open WhatsApp & Send Code
+                      </a>
+                      <p className="text-[10px] text-zinc-400 text-center mt-2">
+                        WhatsApp will open with your code already typed. Just press Send!
+                      </p>
+                    </div>
+
+                    {/* Desktop: QR Code & Web Link */}
+                    <div className="hidden sm:flex flex-col items-center justify-center p-3 bg-white border border-slate-200 rounded-xl text-center space-y-2.5">
+                      <div className="p-2 bg-white rounded-lg border border-slate-100 shadow-xs">
+                        <QRCodeCanvas value={waMobileUrl} size={150} level="M" />
+                      </div>
+                      <div className="text-[11px] text-zinc-500">
+                        Scan with your phone camera to send via WhatsApp
+                      </div>
+                      <a
+                        href={waWebUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1.5 text-xs font-bold text-emerald-700 hover:text-emerald-900 hover:underline cursor-pointer"
+                      >
+                        <ExternalLink size={13} />
+                        Or open in WhatsApp Web
+                      </a>
+                    </div>
+
+                    {/* Polling Live Radar */}
+                    <div className="flex items-center justify-center gap-2 pt-1 text-xs text-zinc-500">
+                      <span className="relative flex h-2.5 w-2.5">
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                        <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
+                      </span>
+                      <span>Waiting for message to be sent...</span>
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================= */}
+      {/* ORDER HISTORY MODAL                                       */}
+      {/* ========================================================= */}
+      {orderHistoryModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4 animate-in fade-in duration-150">
+          <div className="bg-white rounded-2xl border border-slate-200 max-w-2xl w-full max-h-[85vh] shadow-2xl flex flex-col overflow-hidden animate-in zoom-in-95 duration-150">
+            {/* Header */}
+            <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between shrink-0">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-full bg-[#D3E3FD] text-[#041E49] flex items-center justify-center shrink-0">
+                  <Package size={16} />
+                </div>
+                <div>
+                  <h3 className="font-bold text-sm text-zinc-950">My Order History</h3>
+                  <p className="text-[11px] text-zinc-500">
+                    Orders linked to <span className="font-mono font-bold text-zinc-700">{authCustomerPhone}</span>
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => fetchPastOrders(authCustomerPhone)}
+                  className="p-1.5 hover:bg-slate-100 rounded-lg text-zinc-500 hover:text-zinc-800 transition-colors cursor-pointer"
+                  title="Refresh orders"
+                >
+                  <RefreshCw size={14} className={pastOrdersLoading ? "animate-spin" : ""} />
+                </button>
+                <button
+                  onClick={() => setOrderHistoryModalOpen(false)}
+                  className="w-7 h-7 rounded-lg hover:bg-slate-100 flex items-center justify-center text-zinc-400 hover:text-zinc-700 transition-colors cursor-pointer"
+                >
+                  <X size={16} />
+                </button>
+              </div>
+            </div>
+
+            {/* Orders Content Area */}
+            <div className="flex-1 overflow-y-auto p-5 space-y-3">
+              {pastOrdersLoading ? (
+                <div className="py-12 flex flex-col items-center justify-center text-center">
+                  <RefreshCw size={24} className="animate-spin text-[#0B57D0] mb-3" />
+                  <p className="text-xs font-semibold text-zinc-600">Retrieving your orders...</p>
+                </div>
+              ) : pastOrders.length === 0 ? (
+                <div className="py-12 flex flex-col items-center justify-center text-center max-w-sm mx-auto">
+                  <div className="w-12 h-12 rounded-full bg-slate-100 text-zinc-400 flex items-center justify-center mb-3">
+                    <Package size={22} />
+                  </div>
+                  <h4 className="font-bold text-sm text-zinc-900">No Past Orders Found</h4>
+                  <p className="text-xs text-zinc-500 mt-1 leading-relaxed">
+                    We couldn't find any orders matching phone <span className="font-mono font-bold text-zinc-700">{authCustomerPhone}</span>.
+                    Any orders placed with this phone number will appear here automatically.
+                  </p>
+                </div>
+              ) : (
+                pastOrders.map((ord: any) => {
+                  const isVerified = ord.payment_status === "verified";
+                  const isPickup = (ord.delivery_address || "").toLowerCase().includes("self-pickup");
+                  const dateStr = ord.created_at
+                    ? new Date(Number(ord.created_at)).toLocaleDateString("en-GB", {
+                        day: "numeric",
+                        month: "short",
+                        year: "numeric",
+                        hour: "2-digit",
+                        minute: "2-digit"
+                      })
+                    : "";
+
+                  return (
+                    <div
+                      key={ord.id}
+                      className="bg-white rounded-xl border border-slate-200 p-4 hover:border-slate-300 transition-colors shadow-2xs space-y-3"
+                    >
+                      {/* Top Row: Ref, Date, Badges */}
+                      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-2.5">
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono font-extrabold text-xs text-zinc-950">
+                            {ord.order_ref}
+                          </span>
+                          <span className="text-[11px] text-zinc-400">•</span>
+                          <span className="text-[11px] text-zinc-500">{dateStr}</span>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          {/* Payment status badge */}
+                          {isVerified ? (
+                            <span className="inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
+                              <CheckCircle2 size={11} />
+                              Paid
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200">
+                              <Clock size={11} />
+                              Awaiting PayNow
+                            </span>
+                          )}
+
+                          {/* Fulfillment status badge */}
+                          <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-100 text-zinc-700 border border-slate-200">
+                            {ord.fulfillment_status === "completed"
+                              ? (isPickup ? "Collected" : "Delivered")
+                              : ord.fulfillment_status === "out_for_delivery"
+                              ? "Out for Delivery"
+                              : ord.fulfillment_status === "packing"
+                              ? "Packing Cartons"
+                              : isPickup
+                              ? "Ready for Self-Pickup"
+                              : "Order Received"}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Middle Row: Items & Delivery Info */}
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                        <div>
+                          <div className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider mb-1">
+                            Cartons ({ord.total_cartons} CTN)
+                          </div>
+                          <div className="space-y-0.5 max-h-20 overflow-y-auto pr-1">
+                            {ord.items && ord.items.length > 0 ? (
+                              ord.items.map((it: any, iIdx: number) => (
+                                <div key={iIdx} className="text-zinc-700 text-[11px] truncate">
+                                  {it.carton_qty}x {it.name}
+                                </div>
+                              ))
+                            ) : (
+                              <div className="text-zinc-500 text-[11px]">{ord.total_cartons} cartons</div>
+                            )}
+                          </div>
+                        </div>
+
+                        <div>
+                          <div className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider mb-1">
+                            {isPickup ? "Self-Pickup" : "Delivery Address"}
+                          </div>
+                          <div className="text-zinc-700 text-[11px] line-clamp-2">
+                            {isPickup
+                              ? "Warehouse: 9 Eunos Ave 8A, Singapore 409461"
+                              : `${ord.delivery_address || ""} ${ord.unit_no || ""} (S${ord.postal_code || ""})`}
+                          </div>
+                          <div className="text-base font-black text-zinc-950 mt-1">
+                            SGD ${Number(ord.total_amount).toFixed(2)}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Bottom Row Action */}
+                      <div className="pt-2 border-t border-slate-100 flex items-center justify-between">
+                        <span className="text-[11px] text-zinc-400">
+                          {isPickup ? "Self-Pickup order" : "Doorstep Delivery"}
+                        </span>
+                        <button
+                          onClick={() => {
+                            setOrderHistoryModalOpen(false);
+                            loadTrackedOrder(ord.order_ref);
+                          }}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#0B57D0] hover:bg-[#0842A0] text-white rounded-lg text-xs font-bold transition-colors cursor-pointer"
+                        >
+                          View Order & Receipt
+                          <ArrowRight size={13} />
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
+            {/* Footer */}
+            <div className="px-5 py-3 bg-slate-50 border-t border-slate-200 flex items-center justify-between text-xs text-zinc-500 shrink-0">
+              <div className="flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
+                <span>Active session: <strong className="text-zinc-800 font-mono">{authCustomerPhone}</strong></span>
+              </div>
+              <button
+                onClick={handleLogout}
+                className="text-xs text-red-600 hover:text-red-700 font-bold hover:underline cursor-pointer"
+              >
+                Log out
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Policy Modal */}
@@ -3197,7 +3857,7 @@ Thank you!`;
             </p>
             <button
               onClick={() => setPolicyModal(null)}
-              className="mt-4 w-full h-9 bg-zinc-900 text-white rounded-lg text-xs font-bold"
+              className="mt-4 w-full h-9 bg-zinc-900 text-white rounded-lg text-xs font-bold cursor-pointer"
             >
               Close
             </button>
