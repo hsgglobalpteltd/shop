@@ -323,6 +323,18 @@ const OrderPreparingAnimation = () => {
   );
 };
 
+// Sanitize delivery notes: Strip legacy server-injected prefix and keep genuine customer notes only
+const cleanCustomerNote = (notes?: string | null): string => {
+  if (!notes) return "";
+  let cleaned = notes.trim();
+  cleaned = cleaned.replace(/\[SELF-PICKUP AT WAREHOUSE\][^\n•]*(?:•\s*Note:\s*)?/gi, "").trim();
+  cleaned = cleaned.replace(/\[Auto-verified via PayNow Email alert:[^\]]*\]/gi, "").trim();
+  cleaned = cleaned.replace(/\[REJECTED:[^\]]*\]/gi, "").trim();
+  cleaned = cleaned.replace(/^•\s*|•\s*$/g, "").trim();
+  cleaned = cleaned.replace(/^Note:\s*/gi, "").trim();
+  return cleaned;
+};
+
 // Milestone Timeline Steps Calculator
 const getTimelineSteps = (order: any) => {
   const isPickup = order?.delivery_address?.toLowerCase().includes("self-pickup");
@@ -453,26 +465,29 @@ export default function App() {
     }
   }, [cart]);
 
-  // Track footer overlap to push floating cart bar up above footer when scrolled to bottom
+  // Track footer line to dock floating cart bar directly centered on the middle line
   const footerRef = useRef<HTMLElement | null>(null);
-  const [footerOverlap, setFooterOverlap] = useState<number>(0);
+  const floatingBarRef = useRef<HTMLDivElement | null>(null);
+  const [footerOverlap, setFooterOverlap] = useState<number>(20);
 
   useEffect(() => {
     let rafId: number | null = null;
 
     const updatePosition = () => {
-      // 1. If at or near top of the page (not scrolled down to footer yet), always keep default bottom position
-      const scrollY = window.scrollY || document.documentElement.scrollTop || 0;
-      if (scrollY <= 20 || !footerRef.current) {
-        setFooterOverlap((prev) => (prev !== 0 ? 0 : prev));
+      if (!footerRef.current) {
+        setFooterOverlap((prev) => (prev !== 20 ? 20 : prev));
         return;
       }
 
-      // 2. Only when scrolled down and footer enters the viewport, push container up
+      // Dock floating bar so its vertical center aligns exactly on the footer divider line (middle line)
       const rect = footerRef.current.getBoundingClientRect();
       const windowHeight = window.innerHeight;
-      const overlap = rect.top < windowHeight ? Math.max(0, windowHeight - rect.top) : 0;
-      setFooterOverlap((prev) => (Math.abs(prev - overlap) > 0.5 ? overlap : prev));
+      const lineDistance = windowHeight - rect.top;
+      const barHeight = floatingBarRef.current?.offsetHeight || 56;
+      const halfBar = barHeight / 2;
+
+      const targetBottom = Math.max(20, Math.round(lineDistance - halfBar));
+      setFooterOverlap((prev) => (Math.abs(prev - targetBottom) > 0.5 ? targetBottom : prev));
     };
 
     const handleScrollOrResize = () => {
@@ -741,8 +756,8 @@ export default function App() {
 
   const isPolicyRoute = currentPath === "/policy" || currentPath === "/privacy" || currentPath === "/privacy-policy";
   const isTncRoute = currentPath === "/tnc" || currentPath === "/terms" || currentPath === "/terms-and-conditions";
-  const isThankYouRoute = currentPath === "/complete" || currentPath === "/order-complete" || currentPath === "/thankyou" || currentPath.startsWith("/complete/") || Boolean(thankYouOrder);
-  const isTrackingRoute = currentPath === "/track" || currentPath === "/track-order" || currentPath === "/tracking" || currentPath.startsWith("/track/") || Boolean(trackedOrder);
+  const isTrackingRoute = currentPath === "/track" || currentPath === "/track-order" || currentPath === "/tracking" || currentPath.startsWith("/track/") || (Boolean(trackedOrder) && !thankYouOrder && currentPath !== "/complete" && currentPath !== "/order-complete" && currentPath !== "/thankyou");
+  const isThankYouRoute = !isTrackingRoute && (currentPath === "/complete" || currentPath === "/order-complete" || currentPath === "/thankyou" || currentPath.startsWith("/complete/") || Boolean(thankYouOrder));
 
   // WhatsApp Customer Auth & Order History States
   const [authCustomerPhone, setAuthCustomerPhone] = useState<string>(() => {
@@ -2016,20 +2031,6 @@ export default function App() {
           return 0;
         })();
 
-        const waMessage = `*Order ID: ${thankYouOrder.order_ref}*
-Hi HSG Global, here is my order confirmation.
-Tracking & Receipt: ${trackingUrl}
-
-Amount: SGD $${Number(thankYouOrder.total_amount).toFixed(2)}
-Cartons: ${thankYouOrder.total_cartons} CTN
-Customer: ${thankYouOrder.customer_name} (${thankYouOrder.customer_phone})
-
-Here is the screenshot of my PayNow transfer.
-Thank you!`;
-
-        const targetWhatsApp = settings.whatsapp_number.replace(/[^0-9]/g, "") || "6582345678";
-        const waUrl = `https://wa.me/${targetWhatsApp}?text=${encodeURIComponent(waMessage)}`;
-
         return (
           <div className="flex-1 flex flex-col min-h-[100dvh] bg-white font-primary">
             {/* Top Header */}
@@ -2051,192 +2052,84 @@ Thank you!`;
               </div>
             </div>
 
-            {/* Seamless Main Canvas (2-column on desktop, full-height stream on mobile) */}
-            <main className="flex-1 w-full max-w-5xl mx-auto px-4 sm:px-6 py-4 sm:py-6 flex flex-col justify-between">
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 lg:gap-8 items-center my-auto w-full">
+            {/* Seamless Main Canvas (Clean, perfectly centered layout on all devices) */}
+            <main className="flex-1 w-full max-w-md mx-auto px-4 sm:px-6 py-6 sm:py-8 flex flex-col justify-between items-center text-center">
+              <div className="flex flex-col items-center text-center space-y-4 sm:space-y-5 my-auto w-full">
                 
-                {/* COLUMN 1: Order Status & Big Reference */}
-                <div className="lg:col-span-6 flex flex-col items-center text-center space-y-3 sm:space-y-4">
-                  {/* Animation + Status pill */}
-                  <div className="flex flex-col items-center">
-                    <OrderPreparingAnimation />
-                    <div className="inline-flex items-center gap-1.5 px-3 py-0.5 sm:py-1 rounded-full text-[11px] sm:text-xs font-bold bg-blue-50 text-[#0B57D0] border border-blue-200 mt-1">
-                      <Package size={13} className="text-[#0B57D0]" />
-                      <span>Order is Preparing in Warehouse</span>
-                    </div>
-                  </div>
-
-                  {/* Heading & Subtext */}
-                  <div className="space-y-1 max-w-md">
-                    <h1 className="text-xl sm:text-2xl lg:text-3xl font-black text-zinc-950 tracking-tight">
-                      Thank You For Your Order!
-                    </h1>
-                    <p className="text-xs text-zinc-500 leading-relaxed">
-                      We have received your order details. Our warehouse team is packing and preparing your cartons.
-                    </p>
-                  </div>
-
-                  {/* Big Order Ref Card (Clean & Borderless) */}
-                  <div className="w-full max-w-md py-3 sm:py-4 px-4 bg-slate-50 border border-slate-200/80 rounded-2xl text-center space-y-1">
-                    <span className="text-[10px] font-extrabold uppercase tracking-widest text-zinc-400 block">
-                      Order Reference
-                    </span>
-                    <div className="flex items-center justify-center gap-2.5">
-                      <span className="text-2xl sm:text-3xl lg:text-4xl font-black font-mono tracking-wider text-zinc-950 select-all">
-                        {thankYouOrder.order_ref}
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          navigator.clipboard.writeText(thankYouOrder.order_ref);
-                          setThankYouCopied(true);
-                          setTimeout(() => setThankYouCopied(false), 2000);
-                        }}
-                        className="p-1.5 sm:p-2 bg-white border border-slate-200 hover:bg-slate-100 active:scale-95 rounded-xl text-zinc-700 shadow-2xs transition-all cursor-pointer"
-                        title="Copy Order Reference"
-                      >
-                        {thankYouCopied ? <Check size={16} className="text-emerald-600" /> : <Copy size={16} />}
-                      </button>
-                    </div>
-                    <div className="text-xs text-zinc-600 pt-0.5">
-                      Total Amount: <span className="font-bold text-zinc-950">SGD ${Number(thankYouOrder.total_amount).toFixed(2)}</span> • {thankYouOrder.total_cartons} Cartons
-                    </div>
-                    {thankYouBcrsAmount > 0 && (
-                      <div className="text-[11px] text-zinc-400">
-                        (Includes <strong className="text-zinc-600">SGD ${thankYouBcrsAmount.toFixed(2)}</strong> BCRS Applied)
-                      </div>
-                    )}
+                {/* Animation + Status pill */}
+                <div className="flex flex-col items-center">
+                  <OrderPreparingAnimation />
+                  <div className="inline-flex items-center px-3 py-1 rounded-full text-xs font-bold bg-blue-50 text-[#0B57D0] border border-blue-200 mt-1">
+                    <span>HSG GLOBAL SHOP</span>
                   </div>
                 </div>
 
-                {/* COLUMN 2: Verification Actions (WhatsApp & Tracking) */}
-                <div className="lg:col-span-6 flex flex-col justify-center space-y-3 sm:space-y-4 max-w-md mx-auto w-full">
-                  
-                  {/* WhatsApp Order Confirmation Sent Notice */}
-                  {thankYouOrder.customer_phone && (
-                    <div className="bg-blue-50/70 border border-blue-200/80 rounded-2xl p-3.5 text-left flex items-start gap-2.5">
-                      <div className="w-5 h-5 rounded-full bg-[#0B57D0] text-white flex items-center justify-center shrink-0 mt-0.5">
-                        <Check size={12} />
-                      </div>
-                      <div className="text-xs text-zinc-700 leading-snug flex-1">
-                        <div className="flex items-center justify-between gap-2 flex-wrap">
-                          <span className="font-bold text-zinc-900">Order Confirmation Sent to WhatsApp</span>
-                          <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-700 bg-emerald-100/70 px-2 py-0.5 rounded-full">
-                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
-                            Auto-Logged In
-                          </span>
-                        </div>
-                        <p className="text-[11px] text-zinc-500 mt-1">
-                          We sent your order details to <strong>{thankYouOrder.customer_phone}</strong>. You are automatically logged in to track and view all your orders.
-                        </p>
-                      </div>
-                    </div>
-                  )}
+                {/* Heading & Subtext */}
+                <div className="space-y-1 w-full">
+                  <h1 className="text-2xl sm:text-3xl font-black text-zinc-950 tracking-tight">
+                    Your Order Is Confirmed!
+                  </h1>
+                  <p className="text-xs text-zinc-500 leading-relaxed max-w-sm mx-auto">
+                    We have received your order details. Our warehouse team is packing and preparing your cartons.
+                  </p>
+                </div>
 
-                  {/* WhatsApp Payment Slip Handoff */}
-                  <div className="bg-emerald-50/70 border border-emerald-200/80 rounded-2xl p-4 sm:p-5 space-y-3 text-left">
-                    <div className="flex items-center gap-2 font-bold text-xs sm:text-sm text-zinc-900 border-b border-emerald-100 pb-2">
-                      <div className="w-6 h-6 rounded-full bg-[#25D366] text-white flex items-center justify-center shrink-0 shadow-2xs">
-                        <svg className="w-3.5 h-3.5 fill-current" viewBox="0 0 24 24">
-                          <path d="M.057 24l1.687-6.163c-1.041-1.804-1.588-3.849-1.587-5.946.003-6.556 5.338-11.891 11.893-11.891 3.181.001 6.167 1.24 8.413 3.488 2.245 2.248 3.481 5.236 3.48 8.414-.003 6.557-5.338 11.892-11.893 11.892-1.99-.001-3.951-.5-5.688-1.448l-6.305 1.654zm6.597-3.807c1.676.995 3.276 1.591 5.392 1.592 5.448 0 9.886-4.434 9.889-9.885.002-5.462-4.415-9.89-9.881-9.892-5.452 0-9.887 4.434-9.889 9.884-.001 2.225.651 3.891 1.746 5.634l-.999 3.648 3.742-.981zm11.387-5.464c-.074-.124-.272-.198-.57-.347-.297-.149-1.758-.868-2.031-.967-.272-.099-.47-.149-.669.149-.198.297-.768.967-.941 1.165-.173.198-.347.223-.644.074-.297-.149-1.255-.462-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.297-.347.446-.521.151-.172.2-.296.3-.495.099-.198.05-.372-.025-.521-.075-.148-.669-1.611-.916-2.206-.242-.579-.487-.501-.669-.51l-.57-.01c-.198 0-.52.074-.792.372s-1.04 1.016-1.04 2.479 1.065 2.876 1.213 3.074c.149.198 2.095 3.2 5.076 4.487.709.306 1.263.489 1.694.626.712.226 1.36.194 1.872.118.571-.085 1.758-.719 2.006-1.413.248-.695.248-1.29.173-1.414z"/>
-                        </svg>
-                      </div>
-                      <span>Send PayNow Transfer Slip via WhatsApp</span>
-                    </div>
-
-                    <p className="text-xs text-zinc-600 leading-relaxed">
-                      Please send your PayNow transfer screenshot so our finance team can verify and dispatch your cartons promptly.
-                    </p>
-
-                    {/* Desktop: QR Code */}
-                    <div className="hidden lg:flex items-center gap-3 pt-1">
-                      <div className="p-2 bg-white border border-slate-200 rounded-xl shadow-2xs shrink-0">
-                        <QRCodeCanvas
-                          value={waUrl}
-                          size={110}
-                          level="M"
-                          fgColor="#0F172A"
-                          bgColor="#FFFFFF"
-                        />
-                      </div>
-                      <div className="space-y-1.5 text-xs text-zinc-600">
-                        <div className="font-semibold text-zinc-800">Scan QR with your phone</div>
-                        <div className="text-[11px] text-zinc-500">Opens WhatsApp chat with your order details pre-filled.</div>
-                        <a
-                          href={waUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1.5 text-xs font-bold text-emerald-700 hover:text-emerald-900 hover:underline pt-0.5 cursor-pointer"
-                        >
-                          <ExternalLink size={12} />
-                          <span>Or open in WhatsApp Web</span>
-                        </a>
-                      </div>
-                    </div>
-
-                    {/* Mobile: 1-Tap WhatsApp Button */}
-                    <div className="lg:hidden">
-                      <a
-                        href={waUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="w-full h-11 bg-[#25D366] hover:bg-[#20bd5a] text-white font-bold text-xs rounded-xl inline-flex items-center justify-center gap-2 transition-transform active:scale-98 shadow-xs cursor-pointer"
-                      >
-                        <Phone size={15} />
-                        <span>Open WhatsApp & Send Slip</span>
-                      </a>
-                    </div>
-                  </div>
-
-                  {/* Self-Pickup Info (if applicable) */}
-                  {isPickup && (
-                    <div className="bg-slate-50 border border-slate-200 rounded-2xl p-3.5 text-left space-y-1 text-xs">
-                      <div className="flex items-center gap-1.5 font-bold text-zinc-900">
-                        <Building2 size={13} className="text-[#0B57D0]" />
-                        <span>Warehouse Self-Pickup Details</span>
-                      </div>
-                      <p className="text-zinc-600 text-[11px]">
-                        Address: <strong className="text-zinc-900">{settings.warehouse_address || "9 Eunos Ave 8A, Singapore 409461"}</strong>
-                      </p>
-                      <p className="text-zinc-400 text-[10px]">
-                        Hours: {settings.pickup_hours || "Mon - Fri: 10:00 AM - 6:00 PM"} (Closed Weekends & Public Holidays)
-                      </p>
-                    </div>
-                  )}
-
-                  {/* CTA Buttons: Track Order & View Order History */}
-                  <div className="space-y-2 pt-1">
+                {/* Big Order Ref Card (Clean, Borderless, Centered) */}
+                <div className="w-full py-4 px-4 bg-slate-50 border border-slate-200/80 rounded-2xl text-center space-y-1.5 shadow-2xs">
+                  <span className="text-[10px] font-extrabold uppercase tracking-widest text-zinc-400 block">
+                    Order Reference
+                  </span>
+                  <div className="flex items-center justify-center gap-2.5">
+                    <span className="text-3xl sm:text-4xl font-black font-mono tracking-wider text-zinc-950 select-all">
+                      {thankYouOrder.order_ref}
+                    </span>
                     <button
                       type="button"
                       onClick={() => {
-                        setTrackedOrder(thankYouOrder);
-                        setTrackingOrderRef(thankYouOrder.order_ref);
-                        navigateTo(`/track?ref=${thankYouOrder.order_ref}`);
-                        loadTrackedOrder(thankYouOrder.order_ref);
+                        navigator.clipboard.writeText(thankYouOrder.order_ref);
+                        setThankYouCopied(true);
+                        setTimeout(() => setThankYouCopied(false), 2000);
                       }}
-                      className="w-full h-11 sm:h-12 rounded-xl sm:rounded-2xl bg-[#0B57D0] hover:bg-[#0842A0] text-white font-bold text-xs sm:text-sm inline-flex items-center justify-center gap-2 shadow-xs transition-transform active:scale-98 cursor-pointer"
+                      className="p-2 bg-white border border-slate-200 hover:bg-slate-100 active:scale-95 rounded-xl text-zinc-700 shadow-2xs transition-all cursor-pointer"
+                      title="Copy Order Reference"
                     >
-                      <Package size={16} />
-                      <span>Track Order & View Digital Receipt →</span>
+                      {thankYouCopied ? <Check size={16} className="text-emerald-600" /> : <Copy size={16} />}
                     </button>
-
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const p = thankYouOrder.customer_phone || authCustomerPhone;
-                        setOrderHistoryModalOpen(true);
-                        if (p) fetchPastOrders(p);
-                      }}
-                      className="w-full h-10 sm:h-11 rounded-xl sm:rounded-2xl bg-white hover:bg-slate-50 text-zinc-800 font-bold text-xs inline-flex items-center justify-center gap-2 border border-slate-200 shadow-2xs transition-all active:scale-98 cursor-pointer"
-                    >
-                      <Clock size={15} className="text-[#0B57D0]" />
-                      <span>View All My Orders (Order History)</span>
-                    </button>
-
-                    <p className="text-[11px] text-zinc-400 text-center">
-                      View real-time fulfillment timeline, carton breakdown, and receipt anytime.
-                    </p>
                   </div>
+                  <div className="text-xs text-zinc-600 pt-0.5">
+                    Total Amount: <span className="font-bold text-zinc-950">SGD ${Number(thankYouOrder.total_amount).toFixed(2)}</span> • {thankYouOrder.total_cartons} Cartons
+                  </div>
+                  {thankYouBcrsAmount > 0 && (
+                    <div className="text-[11px] text-zinc-400">
+                      (Includes <strong className="text-zinc-600">SGD ${thankYouBcrsAmount.toFixed(2)}</strong> BCRS Applied)
+                    </div>
+                  )}
+                </div>
+
+
+                {/* CTA Buttons: Track Order & View Order History */}
+                <div className="w-full space-y-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const target = thankYouOrder;
+                      const ref = target?.order_ref;
+                      if (!ref) return;
+                      setTrackedOrder(target);
+                      setTrackingOrderRef(ref);
+                      setThankYouOrder(null);
+                      navigateTo(`/track?ref=${ref}`);
+                      loadTrackedOrder(ref);
+                    }}
+                    className="w-full h-11 sm:h-12 rounded-xl sm:rounded-2xl bg-[#0B57D0] hover:bg-[#0842A0] text-white font-bold text-xs sm:text-sm inline-flex items-center justify-center gap-2 shadow-xs transition-transform active:scale-98 cursor-pointer"
+                  >
+                    <Package size={16} />
+                    <span>Track Order & View Digital Receipt →</span>
+                  </button>
+
+                  <p className="text-[11px] text-zinc-400 text-center pt-1">
+                    View live order status and receipt anytime.
+                  </p>
                 </div>
 
               </div>
@@ -2369,12 +2262,12 @@ Thank you!`;
 
               {/* 1. TIMELINE STATUS CARD (Print Hidden) */}
               <div className="bg-white border border-slate-200 rounded-3xl p-5 sm:p-7 shadow-xs space-y-5 print:hidden">
-                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-3">
-                  <div>
+                <div className="flex flex-col sm:flex-row items-center justify-between gap-3 border-b border-slate-100 pb-3 text-center sm:text-left">
+                  <div className="text-center sm:text-left">
                     <h2 className="text-base font-bold text-zinc-950">Fulfillment Timeline</h2>
                     <p className="text-xs text-zinc-500">Live order milestone tracking</p>
                   </div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center justify-center gap-2 flex-wrap sm:flex-nowrap">
                     <button
                       type="button"
                       onClick={() => {
@@ -2523,14 +2416,44 @@ Thank you!`;
                       {isPickup ? <Building2 size={13} className="text-[#0B57D0]" /> : <Truck size={13} className="text-[#0B57D0]" />}
                       <span>{isPickup ? "Warehouse Self-Pickup" : "Doorstep Delivery"}</span>
                     </div>
-                    <div className="text-zinc-600">
-                      {isPickup
-                        ? (settings.warehouse_address || "9 Eunos Ave 8A, EUNOS INDUSTRIAL ESTATE, Singapore 409461")
-                        : `${trackedOrder.delivery_address || ""} ${trackedOrder.unit_no || ""} (S${trackedOrder.postal_code || ""})`}
-                    </div>
-                    {trackedOrder.delivery_notes && (
-                      <div className="text-[11px] text-zinc-500 italic">
-                        Note: "{trackedOrder.delivery_notes}"
+                    {isPickup ? (() => {
+                      const warehouseContact = settings.store_person_contact || (() => {
+                        const match = (trackedOrder.delivery_notes || "").match(/Store Person:\s*(\+?[\d\s]+)/i);
+                        return match ? match[1].trim() : "+65 8123 4567";
+                      })();
+                      const cleanTel = warehouseContact.replace(/\s+/g, "");
+
+                      return (
+                        <div className="text-zinc-600 space-y-1.5 pt-0.5">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="font-semibold text-zinc-900 text-xs">
+                              {settings.store_person_name || "Warehouse Store Person"}
+                            </span>
+                            <a
+                              href={`tel:${cleanTel}`}
+                              className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md bg-blue-50 hover:bg-blue-100 text-[#0B57D0] hover:text-[#0842A0] font-bold border border-blue-200/80 transition-all active:scale-95 text-xs shadow-2xs cursor-pointer"
+                              title="Call Warehouse Person"
+                            >
+                              <Phone size={11} className="text-[#0B57D0]" />
+                              <span>{warehouseContact}</span>
+                            </a>
+                          </div>
+                          <div className="text-zinc-700 leading-snug text-xs">
+                            {settings.warehouse_address || "9 Eunos Ave 8A, EUNOS INDUSTRIAL ESTATE, Singapore 409461"}
+                          </div>
+                          <div className="text-[11px] text-zinc-500 font-medium">
+                            Collection Hours: {settings.pickup_hours || "Mon - Fri: 10:00 AM - 6:00 PM"}
+                          </div>
+                        </div>
+                      );
+                    })() : (
+                      <div className="text-zinc-600">
+                        {`${trackedOrder.delivery_address || ""} ${trackedOrder.unit_no || ""} (S${trackedOrder.postal_code || ""})`}
+                      </div>
+                    )}
+                    {cleanCustomerNote(trackedOrder.delivery_notes) && (
+                      <div className="text-[11px] text-zinc-500 italic pt-1">
+                        Note: "{cleanCustomerNote(trackedOrder.delivery_notes)}"
                       </div>
                     )}
                   </div>
@@ -2560,11 +2483,13 @@ Thank you!`;
 
                 {/* 3. FULL LIST OF ITEMS ORDERED */}
                 <div className="space-y-3">
-                  <div className="flex items-center justify-between border-b border-slate-200 pb-2">
-                    <h3 className="font-extrabold text-xs uppercase tracking-wider text-zinc-900">
+                  <div className="flex items-center justify-between border-b border-slate-200 pb-2 gap-2">
+                    <h3 className="font-bold text-xs uppercase tracking-wide text-zinc-900 whitespace-nowrap">
                       Ordered Cartons ({trackedOrder.total_cartons} CTN)
                     </h3>
-                    <span className="text-xs text-zinc-400">Itemized Specifications</span>
+                    <span className="text-[11px] text-zinc-400 whitespace-nowrap hidden sm:inline">
+                      Itemized Specifications
+                    </span>
                   </div>
 
                   <div className="divide-y divide-slate-100">
@@ -2575,38 +2500,46 @@ Thank you!`;
                       const hasItemBcrs = Boolean(item.has_bcrs || itemProd?.has_bcrs || (item.loose_bottles && item.loose_bottles.some((lb: any) => lb.has_bcrs || productMap.get(lb.sku)?.has_bcrs)));
 
                       return (
-                        <div key={idx} className="py-3 flex flex-col sm:flex-row sm:items-start justify-between gap-3 text-xs">
-                          <div className="space-y-1 flex-1">
-                            <div className="font-bold text-zinc-900 text-sm">
+                        <div key={idx} className="py-2.5 flex items-start justify-between gap-3 text-xs">
+                          <div className="min-w-0 flex-1 space-y-0.5">
+                            <div className="font-medium text-zinc-900 text-xs truncate" title={item.name}>
                               {item.name}
                             </div>
 
                             {/* Packaging Specifications & BCRS Badge */}
-                            <div className="text-[11px] text-zinc-500 flex flex-wrap items-center gap-2">
+                            <div className="text-[11px] text-zinc-500 flex flex-wrap items-center gap-1.5">
+                              <span>
+                                {item.carton_qty} ctn × ${Number(item.carton_price).toFixed(2)}
+                              </span>
                               {item.sku && (
-                                <span className="font-mono text-zinc-400">
-                                  SKU: {item.sku}
-                                </span>
+                                <>
+                                  <span className="text-zinc-300">•</span>
+                                  <span className="font-mono text-zinc-400 text-[10px]">
+                                    SKU: {item.sku}
+                                  </span>
+                                </>
                               )}
                               {hasItemBcrs && (
-                                <span className="bg-slate-100 text-zinc-600 border border-slate-200 px-1.5 py-0.5 rounded text-[10px] font-medium">
-                                  BCRS Applied
-                                </span>
+                                <>
+                                  <span className="text-zinc-300">•</span>
+                                  <span className="bg-slate-100 text-zinc-600 border border-slate-200 px-1 py-0.2 rounded text-[9px] font-medium">
+                                    BCRS Applied
+                                  </span>
+                                </>
                               )}
                             </div>
 
-
                             {/* Custom Mix Loose Bottle Breakdown */}
                             {isMix && item.loose_bottles && item.loose_bottles.length > 0 && (
-                              <div className="mt-2 bg-slate-50 border border-slate-200/70 rounded-xl p-2.5 space-y-1">
-                                <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block">
+                              <div className="mt-1.5 bg-slate-50 border border-slate-200/70 rounded-xl p-2 space-y-1">
+                                <span className="text-[9px] font-bold text-zinc-400 uppercase tracking-wider block">
                                   Intra-Brand Mix Selections:
                                 </span>
-                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-1 text-[11px]">
+                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-1 text-[10px]">
                                   {item.loose_bottles.map((b: any, bIdx: number) => (
                                     <div key={bIdx} className="flex items-center justify-between pr-2 text-zinc-700">
-                                      <span>• {b.flavor || b.name || b.sku}</span>
-                                      <span className="font-bold text-zinc-900">{b.qty} pcs</span>
+                                      <span className="truncate">• {b.flavor || b.name || b.sku}</span>
+                                      <span className="font-medium text-zinc-900 shrink-0 ml-1">{b.qty} pcs</span>
                                     </div>
                                   ))}
                                 </div>
@@ -2615,12 +2548,9 @@ Thank you!`;
                           </div>
 
                           {/* Qty & Price */}
-                          <div className="text-left sm:text-right shrink-0 space-y-0.5">
-                            <div className="font-black text-sm text-zinc-950">
+                          <div className="text-right shrink-0 pt-0.5">
+                            <div className="font-semibold text-xs text-zinc-900">
                               SGD ${lineTotal.toFixed(2)}
-                            </div>
-                            <div className="text-[11px] text-zinc-400">
-                              {item.carton_qty} ctn × ${Number(item.carton_price).toFixed(2)}
                             </div>
                           </div>
                         </div>
@@ -3085,8 +3015,9 @@ Thank you!`;
       {/* ========================================================= */}
       {totalCartons > 0 && !trackedOrder && !thankYouOrder && !isThankYouRoute && !isTrackingRoute && !cartDrawerOpen && !checkoutModalOpen && !paymentModalOpen && (
         <div 
+          ref={floatingBarRef}
           className="fixed inset-x-4 max-w-md mx-auto z-40 animate-in slide-in-from-bottom duration-200 pointer-events-none"
-          style={{ bottom: `${footerOverlap + 20}px` }}
+          style={{ bottom: `${footerOverlap}px` }}
         >
           <div className="bg-white/95 backdrop-blur-md text-zinc-900 px-3.5 py-2.5 rounded-full shadow-lg border border-slate-200 flex items-center justify-between gap-3 pointer-events-auto">
             <div className="flex items-center gap-2.5 pl-1 min-w-0">
@@ -3855,6 +3786,19 @@ Thank you!`;
                       <div className="text-zinc-700">
                         <span className="font-semibold text-zinc-500">Collection Timing: </span>
                         <span className="font-bold text-zinc-900">{settings.pickup_hours || "Mon - Fri: 10:00 AM - 6:00 PM"}</span>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2 pt-2 border-t border-blue-200/60 text-xs">
+                      <Phone size={14} className="text-[#0B57D0] shrink-0" />
+                      <div className="text-zinc-700">
+                        <span className="font-semibold text-zinc-500">Warehouse Contact: </span>
+                        <a
+                          href={`tel:${(settings.store_person_contact || "+65 8123 4567").replace(/\s+/g, "")}`}
+                          className="font-bold text-[#0B57D0] hover:underline"
+                        >
+                          {settings.store_person_name || "Warehouse Store Person"} ({settings.store_person_contact || "+65 8123 4567"})
+                        </a>
                       </div>
                     </div>
 
