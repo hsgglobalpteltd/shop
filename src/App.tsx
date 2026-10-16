@@ -249,9 +249,9 @@ const OrderPreparingAnimation = () => {
   const [lottieError, setLottieError] = useState(false);
 
   return (
-    <div className="flex flex-col items-center justify-center select-none py-0.5">
+    <div className="flex flex-col items-center justify-center select-none">
       {!lottieError ? (
-        <div className="w-24 h-24 sm:w-32 sm:h-32 md:w-36 md:h-36 relative flex items-center justify-center">
+        <div className="w-28 h-28 sm:w-36 sm:h-36 relative flex items-center justify-center">
           <DotLottieReact
             src="/order-completed.lottie"
             loop
@@ -264,7 +264,7 @@ const OrderPreparingAnimation = () => {
 
       {/* High-quality Animated SVG: Always renders or falls back if Lottie fails */}
       {lottieError && (
-        <div className="w-20 h-20 sm:w-28 sm:h-28 md:w-32 md:h-32 relative flex items-center justify-center">
+        <div className="w-24 h-24 sm:w-32 sm:h-32 relative flex items-center justify-center">
           <svg className="w-full h-full" viewBox="0 0 200 200" fill="none" xmlns="http://www.w3.org/2000/svg">
             <style>{`
               @keyframes bounceBox {
@@ -333,6 +333,39 @@ const cleanCustomerNote = (notes?: string | null): string => {
   cleaned = cleaned.replace(/^•\s*|•\s*$/g, "").trim();
   cleaned = cleaned.replace(/^Note:\s*/gi, "").trim();
   return cleaned;
+};
+
+// Mask last 3 characters of each word in customer name with *
+const maskCustomerName = (name?: string | null): string => {
+  if (!name) return "";
+  return name
+    .trim()
+    .split(/\s+/)
+    .map((word) => {
+      if (word.length > 3) {
+        return word.slice(0, word.length - 3) + "***";
+      }
+      if (word.length > 1) {
+        return word.slice(0, 1) + "*".repeat(word.length - 1);
+      }
+      return "*";
+    })
+    .join(" ");
+};
+
+// Mask last 4 digits of customer phone number with *
+const maskCustomerPhone = (phone?: string | null): string => {
+  if (!phone) return "";
+  const chars = phone.trim().split("");
+  let replaced = 0;
+  for (let i = chars.length - 1; i >= 0; i--) {
+    if (/\d/.test(chars[i])) {
+      chars[i] = "*";
+      replaced++;
+      if (replaced === 4) break;
+    }
+  }
+  return chars.join("");
 };
 
 // Milestone Timeline Steps Calculator
@@ -761,9 +794,19 @@ export default function App() {
 
   // WhatsApp Customer Auth & Order History States
   const [authCustomerPhone, setAuthCustomerPhone] = useState<string>(() => {
+    const normPath = window.location.pathname.toLowerCase().replace(/\/$/, "");
+    const params = new URLSearchParams(window.location.search);
+    if (normPath.startsWith("/track") || params.get("track") || params.get("ref")) {
+      return "";
+    }
     try { return localStorage.getItem("hsg_auth_phone") || ""; } catch { return ""; }
   });
   const [authCustomerName, setAuthCustomerName] = useState<string>(() => {
+    const normPath = window.location.pathname.toLowerCase().replace(/\/$/, "");
+    const params = new URLSearchParams(window.location.search);
+    if (normPath.startsWith("/track") || params.get("track") || params.get("ref")) {
+      return "";
+    }
     try { return localStorage.getItem("hsg_auth_name") || ""; } catch { return ""; }
   });
   const [loginModalOpen, setLoginModalOpen] = useState<boolean>(false);
@@ -773,6 +816,82 @@ export default function App() {
   const [pastOrders, setPastOrders] = useState<any[]>([]);
   const [pastOrdersLoading, setPastOrdersLoading] = useState<boolean>(false);
   const [authCopied, setAuthCopied] = useState<boolean>(false);
+
+  // Track Page 4-Digit Phone Owner Verification States
+  const [verifyOwnerModalOpen, setVerifyOwnerModalOpen] = useState<boolean>(false);
+  const [verifyDigits, setVerifyDigits] = useState<string[]>(["", "", "", ""]);
+  const [verifyError, setVerifyError] = useState<string>("");
+  const [isTrackOwnerVerified, setIsTrackOwnerVerified] = useState<boolean>(false);
+  const [verifyLockoutUntil, setVerifyLockoutUntil] = useState<number>(() => {
+    try {
+      const saved = Number(localStorage.getItem("hsg_verify_lockout_until") || "0");
+      return saved > Date.now() ? saved : 0;
+    } catch {
+      return 0;
+    }
+  });
+  const [verifyLockoutRemainingSec, setVerifyLockoutRemainingSec] = useState<number>(() => {
+    try {
+      const saved = Number(localStorage.getItem("hsg_verify_lockout_until") || "0");
+      return saved > Date.now() ? Math.ceil((saved - Date.now()) / 1000) : 0;
+    } catch {
+      return 0;
+    }
+  });
+  const verifyInputRefs = useRef<(HTMLInputElement | null)[]>([null, null, null, null]);
+
+  useEffect(() => {
+    if (!verifyLockoutUntil || verifyLockoutUntil <= Date.now()) {
+      setVerifyLockoutRemainingSec(0);
+      return;
+    }
+    const updateRemaining = () => {
+      const rem = Math.max(0, Math.ceil((verifyLockoutUntil - Date.now()) / 1000));
+      setVerifyLockoutRemainingSec(rem);
+      if (rem <= 0) {
+        setVerifyLockoutUntil(0);
+        setVerifyError("");
+        try {
+          localStorage.removeItem("hsg_verify_lockout_until");
+        } catch {}
+      }
+    };
+    updateRemaining();
+    const timer = setInterval(updateRemaining, 1000);
+    return () => clearInterval(timer);
+  }, [verifyLockoutUntil]);
+
+  const handleVerifyOwnerSubmit = (digitsToVerify?: string[]) => {
+    if (verifyLockoutUntil > Date.now()) return;
+    const digits = digitsToVerify || verifyDigits;
+    const entered = digits.join("").trim();
+    if (entered.length < 4) {
+      setVerifyError("Please enter all 4 digits.");
+      return;
+    }
+    const actualLast4 = (trackedOrder?.customer_phone || "").replace(/\D/g, "").slice(-4);
+    if (actualLast4 && entered === actualLast4) {
+      setVerifyError("");
+      setIsTrackOwnerVerified(true);
+      setVerifyOwnerModalOpen(false);
+      setVerifyDigits(["", "", "", ""]);
+      const p = trackedOrder.customer_phone;
+      const n = trackedOrder.customer_name || "";
+      setAuthCustomerPhone(p);
+      if (n) setAuthCustomerName(n);
+      setOrderHistoryModalOpen(true);
+      fetchPastOrders(p);
+    } else {
+      const lockUntil = Date.now() + 5 * 60 * 1000;
+      setVerifyLockoutUntil(lockUntil);
+      setVerifyLockoutRemainingSec(300);
+      setVerifyDigits(["", "", "", ""]);
+      setVerifyError("Incorrect last 4 digits. Please wait 5 minutes to try again.");
+      try {
+        localStorage.setItem("hsg_verify_lockout_until", String(lockUntil));
+      } catch {}
+    }
+  };
 
   const handleOpenLogin = async () => {
     setLoginLoading(true);
@@ -812,6 +931,7 @@ export default function App() {
   const handleLogout = () => {
     setAuthCustomerPhone("");
     setAuthCustomerName("");
+    setIsTrackOwnerVerified(false);
     try {
       localStorage.removeItem("hsg_auth_phone");
       localStorage.removeItem("hsg_auth_name");
@@ -930,19 +1050,14 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         if (data.success && data.order) {
-          setTrackedOrder(data.order);
-          // Auto-login customer to view order history
-          if (data.order.customer_phone) {
-            const p = data.order.customer_phone;
-            const n = data.order.customer_name || "";
-            setAuthCustomerPhone(p);
-            if (n) setAuthCustomerName(n);
-            try {
-              localStorage.setItem("hsg_auth_phone", p);
-              if (n) localStorage.setItem("hsg_auth_name", n);
-            } catch (e) {}
-            fetchPastOrders(p);
-          }
+          setTrackedOrder((prev: any) => {
+            if (!prev || prev.order_ref !== data.order.order_ref) {
+              setIsTrackOwnerVerified(false);
+              setVerifyDigits(["", "", "", ""]);
+              setVerifyError("");
+            }
+            return data.order;
+          });
         }
       }
     } catch (e) {
@@ -960,18 +1075,6 @@ export default function App() {
         const data = await res.json();
         if (data.success && data.order) {
           setThankYouOrder(data.order);
-          // Auto-login customer to view order history
-          if (data.order.customer_phone) {
-            const p = data.order.customer_phone;
-            const n = data.order.customer_name || "";
-            setAuthCustomerPhone(p);
-            if (n) setAuthCustomerName(n);
-            try {
-              localStorage.setItem("hsg_auth_phone", p);
-              if (n) localStorage.setItem("hsg_auth_name", n);
-            } catch (e) {}
-            fetchPastOrders(p);
-          }
         }
       }
     } catch (e) {
@@ -2034,7 +2137,7 @@ export default function App() {
         return (
           <div className="flex-1 flex flex-col min-h-[100dvh] bg-white font-primary">
             {/* Top Header */}
-            <div className="sticky top-0 z-20 bg-white/95 backdrop-blur-xs border-b border-slate-200 py-3.5 px-4 shadow-2xs">
+            <div className="sticky top-0 z-20 bg-white/95 backdrop-blur-xs border-b border-slate-200 py-3.5 px-4 shadow-2xs shrink-0">
               <div className="max-w-5xl mx-auto px-4 flex flex-col items-center justify-center text-center">
                 <button
                   type="button"
@@ -2052,63 +2155,31 @@ export default function App() {
               </div>
             </div>
 
-            {/* Seamless Main Canvas (Clean, perfectly centered layout on all devices) */}
-            <main className="flex-1 w-full max-w-md mx-auto px-4 sm:px-6 py-6 sm:py-8 flex flex-col justify-between items-center text-center">
-              <div className="flex flex-col items-center text-center space-y-4 sm:space-y-5 my-auto w-full">
-                
-                {/* Animation + Status pill */}
+            {/* Main Canvas: Confirmation Directly Under Original Header, CTA at Bottom */}
+            <main className="flex-1 w-full max-w-md mx-auto px-4 sm:px-6 pt-1 pb-6 sm:pb-8 flex flex-col justify-between items-center text-center">
+              
+              {/* TOP ZONE (Directly under original header) */}
+              <div className="w-full flex flex-col items-center text-center space-y-3 shrink-0">
                 <div className="flex flex-col items-center">
                   <OrderPreparingAnimation />
-                  <div className="inline-flex items-center px-3 py-1 rounded-full text-xs font-bold bg-blue-50 text-[#0B57D0] border border-blue-200 mt-1">
+                  <div className="inline-flex items-center px-3.5 py-1 rounded-full text-xs font-bold bg-blue-50 text-[#0B57D0] border border-blue-200 mt-1">
                     <span>HSG GLOBAL SHOP</span>
                   </div>
                 </div>
 
-                {/* Heading & Subtext */}
-                <div className="space-y-1 w-full">
+                <div className="space-y-1.5 w-full">
                   <h1 className="text-2xl sm:text-3xl font-black text-zinc-950 tracking-tight">
                     Your Order Is Confirmed!
                   </h1>
-                  <p className="text-xs text-zinc-500 leading-relaxed max-w-sm mx-auto">
+                  <p className="text-xs sm:text-sm text-zinc-500 leading-relaxed max-w-sm mx-auto">
                     We have received your order details. Our warehouse team is packing and preparing your cartons.
                   </p>
                 </div>
+              </div>
 
-                {/* Big Order Ref Card (Clean, Borderless, Centered) */}
-                <div className="w-full py-4 px-4 bg-slate-50 border border-slate-200/80 rounded-2xl text-center space-y-1.5 shadow-2xs">
-                  <span className="text-[10px] font-extrabold uppercase tracking-widest text-zinc-400 block">
-                    Order Reference
-                  </span>
-                  <div className="flex items-center justify-center gap-2.5">
-                    <span className="text-3xl sm:text-4xl font-black font-mono tracking-wider text-zinc-950 select-all">
-                      {thankYouOrder.order_ref}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        navigator.clipboard.writeText(thankYouOrder.order_ref);
-                        setThankYouCopied(true);
-                        setTimeout(() => setThankYouCopied(false), 2000);
-                      }}
-                      className="p-2 bg-white border border-slate-200 hover:bg-slate-100 active:scale-95 rounded-xl text-zinc-700 shadow-2xs transition-all cursor-pointer"
-                      title="Copy Order Reference"
-                    >
-                      {thankYouCopied ? <Check size={16} className="text-emerald-600" /> : <Copy size={16} />}
-                    </button>
-                  </div>
-                  <div className="text-xs text-zinc-600 pt-0.5">
-                    Total Amount: <span className="font-bold text-zinc-950">SGD ${Number(thankYouOrder.total_amount).toFixed(2)}</span> • {thankYouOrder.total_cartons} Cartons
-                  </div>
-                  {thankYouBcrsAmount > 0 && (
-                    <div className="text-[11px] text-zinc-400">
-                      (Includes <strong className="text-zinc-600">SGD ${thankYouBcrsAmount.toFixed(2)}</strong> BCRS Applied)
-                    </div>
-                  )}
-                </div>
-
-
-                {/* CTA Buttons: Track Order & View Order History */}
-                <div className="w-full space-y-2 pt-1">
+              {/* BOTTOM ZONE: Pinned at bottom */}
+              <div className="w-full flex flex-col items-center space-y-3 shrink-0">
+                <div className="w-full space-y-2">
                   <button
                     type="button"
                     onClick={() => {
@@ -2121,37 +2192,37 @@ export default function App() {
                       navigateTo(`/track?ref=${ref}`);
                       loadTrackedOrder(ref);
                     }}
-                    className="w-full h-11 sm:h-12 rounded-xl sm:rounded-2xl bg-[#0B57D0] hover:bg-[#0842A0] text-white font-bold text-xs sm:text-sm inline-flex items-center justify-center gap-2 shadow-xs transition-transform active:scale-98 cursor-pointer"
+                    className="w-full h-12 rounded-xl sm:rounded-2xl bg-[#0B57D0] hover:bg-[#0842A0] text-white font-bold text-xs sm:text-sm inline-flex items-center justify-center gap-2 shadow-xs transition-transform active:scale-98 cursor-pointer"
                   >
                     <Package size={16} />
                     <span>Track Order & View Digital Receipt →</span>
                   </button>
 
-                  <p className="text-[11px] text-zinc-400 text-center pt-1">
+                  <p className="text-[11px] text-zinc-400 text-center">
                     View live order status and receipt anytime.
                   </p>
                 </div>
 
+                {/* Bottom Policy Footer */}
+                <footer className="pt-1 text-center text-xs text-zinc-400 flex items-center justify-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setPolicyModal("terms")}
+                    className="hover:text-zinc-700 underline underline-offset-2 cursor-pointer transition-colors"
+                  >
+                    Delivery Policy
+                  </button>
+                  <span className="text-zinc-300">•</span>
+                  <button
+                    type="button"
+                    onClick={() => setPolicyModal("refund")}
+                    className="hover:text-zinc-700 underline underline-offset-2 cursor-pointer transition-colors"
+                  >
+                    Refund Terms
+                  </button>
+                </footer>
               </div>
 
-              {/* Bottom Policy Footer */}
-              <footer className="pt-4 pb-2 text-center text-xs text-zinc-400 flex items-center justify-center gap-3 shrink-0">
-                <button
-                  type="button"
-                  onClick={() => setPolicyModal("terms")}
-                  className="hover:text-zinc-700 underline underline-offset-2 cursor-pointer transition-colors"
-                >
-                  Delivery Policy
-                </button>
-                <span className="text-zinc-300">•</span>
-                <button
-                  type="button"
-                  onClick={() => setPolicyModal("refund")}
-                  className="hover:text-zinc-700 underline underline-offset-2 cursor-pointer transition-colors"
-                >
-                  Refund Terms
-                </button>
-              </footer>
             </main>
           </div>
         );
@@ -2252,7 +2323,7 @@ export default function App() {
 
                 <h3 className="text-base font-extrabold text-zinc-950">Order Tracking & Receipt</h3>
                 <p className="text-[11px] text-zinc-500 font-mono">
-                  Order <span className="font-bold text-zinc-700">{trackedOrder.order_ref}</span> • Live status & digital receipt
+                  Order <span className="font-bold text-zinc-700">{trackedOrder.order_ref}</span>
                 </p>
               </div>
             </div>
@@ -2271,9 +2342,18 @@ export default function App() {
                     <button
                       type="button"
                       onClick={() => {
-                        const p = trackedOrder.customer_phone || authCustomerPhone;
-                        setOrderHistoryModalOpen(true);
-                        if (p) fetchPastOrders(p);
+                        if (isTrackOwnerVerified) {
+                          const p = trackedOrder.customer_phone || authCustomerPhone;
+                          setOrderHistoryModalOpen(true);
+                          if (p) fetchPastOrders(p);
+                        } else {
+                          setVerifyDigits(["", "", "", ""]);
+                          if (verifyLockoutUntil <= Date.now()) {
+                            setVerifyError("");
+                          }
+                          setVerifyOwnerModalOpen(true);
+                          setTimeout(() => verifyInputRefs.current[0]?.focus(), 80);
+                        }
                       }}
                       className="h-8 px-3 rounded-lg inline-flex items-center gap-1.5 text-xs font-bold text-zinc-700 bg-white border border-slate-200 hover:bg-slate-50 shadow-2xs transition-all cursor-pointer shrink-0"
                       title="View All My Orders"
@@ -2402,8 +2482,8 @@ export default function App() {
                     <span className="text-[10px] font-extrabold uppercase tracking-wider text-zinc-400 block">
                       Customer Information
                     </span>
-                    <div className="font-bold text-zinc-900 text-sm">{trackedOrder.customer_name}</div>
-                    <div className="text-zinc-600">{trackedOrder.customer_phone}</div>
+                    <div className="font-bold text-zinc-900 text-sm">{maskCustomerName(trackedOrder.customer_name)}</div>
+                    <div className="text-zinc-600">{maskCustomerPhone(trackedOrder.customer_phone)}</div>
                     {trackedOrder.customer_email && <div className="text-zinc-500">{trackedOrder.customer_email}</div>}
                   </div>
 
@@ -4213,10 +4293,17 @@ export default function App() {
       {!trackedOrder && !thankYouOrder && !isThankYouRoute && !isTrackingRoute && (
         <footer ref={footerRef} className="bg-white border-t border-slate-200 py-10 mt-auto">
           <div className="max-w-6xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-6 text-xs text-zinc-500 text-center sm:text-left">
-            <div>
-              <div className="font-extrabold text-sm text-zinc-900">{settings.company_name}</div>
-              <div className="mt-1">UEN: {settings.company_uen} • Official Singapore Distribution</div>
-              <div className="mt-0.5">Support WhatsApp: +65 8475 5948 • {settings.support_email}</div>
+            <div className="flex flex-col sm:flex-row items-center gap-3.5">
+              <img
+                src="/HSG Global Logo Official.jpeg"
+                alt={settings.company_name || "HSG Global"}
+                className="w-14 h-14 aspect-square rounded-2xl object-cover border border-slate-200/80 shadow-2xs shrink-0"
+              />
+              <div>
+                <div className="font-extrabold text-sm text-zinc-900">{settings.company_name}</div>
+                <div className="mt-1">UEN: {settings.company_uen} • Official Singapore Distribution</div>
+                <div className="mt-0.5">Support WhatsApp: +65 8475 5948 • {settings.support_email}</div>
+              </div>
             </div>
 
             <div className="flex flex-col sm:flex-row items-center gap-4 w-full sm:w-auto justify-center">
@@ -4393,6 +4480,138 @@ export default function App() {
                   </div>
                 );
               })()}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================= */}
+      {/* VERIFY ORDER OWNER (4-DIGIT PHONE) MODAL                  */}
+      {/* ========================================================= */}
+      {verifyOwnerModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4 animate-in fade-in duration-150">
+          <div className="bg-white rounded-2xl border border-slate-200 max-w-sm w-full shadow-2xl overflow-hidden animate-in zoom-in-95 duration-150">
+            {/* Header */}
+            <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-full bg-blue-50 text-[#0B57D0] flex items-center justify-center shrink-0">
+                  <ShieldCheck size={16} />
+                </div>
+                <div>
+                  <h3 className="font-bold text-sm text-zinc-950">Verify Phone Number</h3>
+                  <p className="text-[11px] text-zinc-500">Enter last 4 digits of phone number</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setVerifyOwnerModalOpen(false)}
+                className="w-7 h-7 rounded-lg hover:bg-slate-100 flex items-center justify-center text-zinc-400 hover:text-zinc-700 transition-colors cursor-pointer"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            {/* Body */}
+            <div className="p-5 space-y-4">
+              <div className="text-center space-y-2">
+                <p className="text-xs text-zinc-600 leading-relaxed">
+                  Please complete the phone number below:
+                </p>
+                <div className="inline-block px-3.5 py-1.5 rounded-lg bg-slate-50 border border-slate-200 font-mono font-extrabold text-sm text-zinc-900 tracking-wider">
+                  {maskCustomerPhone(trackedOrder?.customer_phone)}
+                </div>
+              </div>
+
+              {/* 4 Digit Boxes [ ] [ ] [ ] [ ] */}
+              <div className="flex items-center justify-center gap-3 py-1">
+                {[0, 1, 2, 3].map((idx) => (
+                  <input
+                    key={idx}
+                    ref={(el) => {
+                      verifyInputRefs.current[idx] = el;
+                    }}
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={1}
+                    disabled={verifyLockoutRemainingSec > 0}
+                    value={verifyDigits[idx] || ""}
+                    onChange={(e) => {
+                      const val = e.target.value.replace(/\D/g, "").slice(-1);
+                      const next = [...verifyDigits];
+                      next[idx] = val;
+                      setVerifyDigits(next);
+                      if (verifyError && verifyLockoutRemainingSec <= 0) setVerifyError("");
+                      if (val && idx < 3) {
+                        verifyInputRefs.current[idx + 1]?.focus();
+                      }
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Backspace" && !verifyDigits[idx] && idx > 0) {
+                        const next = [...verifyDigits];
+                        next[idx - 1] = "";
+                        setVerifyDigits(next);
+                        verifyInputRefs.current[idx - 1]?.focus();
+                      } else if (e.key === "Enter") {
+                        handleVerifyOwnerSubmit();
+                      }
+                    }}
+                    onPaste={(e) => {
+                      e.preventDefault();
+                      if (verifyLockoutRemainingSec > 0) return;
+                      const pasted = e.clipboardData.getData("text").replace(/\D/g, "").slice(0, 4);
+                      if (!pasted) return;
+                      const next = ["", "", "", ""];
+                      for (let i = 0; i < 4; i++) {
+                        next[i] = pasted[i] || "";
+                      }
+                      setVerifyDigits(next);
+                      const focusIdx = Math.min(3, pasted.length);
+                      verifyInputRefs.current[focusIdx]?.focus();
+                    }}
+                    className={`w-12 h-13 text-center text-xl font-black font-mono rounded-xl border transition-all outline-none ${
+                      verifyLockoutRemainingSec > 0
+                        ? "bg-slate-100 border-slate-200 text-zinc-400 cursor-not-allowed"
+                        : "bg-white border-slate-300 text-zinc-950 focus:border-[#0B57D0] focus:ring-3 focus:ring-[#0B57D0]/15"
+                    }`}
+                  />
+                ))}
+              </div>
+
+              {/* Error / 5-Minute Cooldown Notice */}
+              {verifyLockoutRemainingSec > 0 ? (
+                <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-center space-y-1">
+                  <div className="text-xs font-bold text-red-700 flex items-center justify-center gap-1.5">
+                    <Clock size={13} />
+                    <span>Phone Number Incorrect</span>
+                  </div>
+                  <p className="text-[11px] text-red-600">
+                    Please wait{" "}
+                    <span className="font-mono font-extrabold">
+                      {String(Math.floor(verifyLockoutRemainingSec / 60)).padStart(2, "0")}:
+                      {String(verifyLockoutRemainingSec % 60).padStart(2, "0")}
+                    </span>{" "}
+                    to try again.
+                  </p>
+                </div>
+              ) : verifyError ? (
+                <div className="text-xs font-semibold text-red-600 text-center">
+                  {verifyError}
+                </div>
+              ) : null}
+
+              {/* Verify Action Button */}
+              <button
+                type="button"
+                disabled={verifyLockoutRemainingSec > 0 || verifyDigits.join("").length < 4}
+                onClick={() => handleVerifyOwnerSubmit()}
+                className={`w-full h-10 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-1.5 ${
+                  verifyLockoutRemainingSec > 0 || verifyDigits.join("").length < 4
+                    ? "bg-slate-100 text-zinc-400 cursor-not-allowed"
+                    : "bg-[#0B57D0] hover:bg-[#0842A0] text-white cursor-pointer shadow-xs active:scale-98"
+                }`}
+              >
+                <span>Verify & View My Orders</span>
+              </button>
             </div>
           </div>
         </div>
