@@ -29,6 +29,7 @@ import {
   Trash2,
   RefreshCw,
   MessageSquare,
+  MessageCircle,
   Printer,
   FileText
 } from "lucide-react";
@@ -122,6 +123,7 @@ interface ShopSettings {
   allow_self_pickup?: boolean;
   show_hero_section?: boolean;
   max_order_amount?: number;
+  meta_whatsapp_phone?: string;
 }
 
 // Carton Size Group for Custom Mix Builder
@@ -338,6 +340,7 @@ const cleanCustomerNote = (notes?: string | null): string => {
 // Mask last 3 characters of each word in customer name with *
 const maskCustomerName = (name?: string | null): string => {
   if (!name) return "";
+  if (name.includes("*")) return name;
   return name
     .trim()
     .split(/\s+/)
@@ -356,6 +359,7 @@ const maskCustomerName = (name?: string | null): string => {
 // Mask last 4 digits of customer phone number with *
 const maskCustomerPhone = (phone?: string | null): string => {
   if (!phone) return "";
+  if (phone.includes("*")) return phone;
   const chars = phone.trim().split("");
   let replaced = 0;
   for (let i = chars.length - 1; i >= 0; i--) {
@@ -368,17 +372,105 @@ const maskCustomerPhone = (phone?: string | null): string => {
   return chars.join("");
 };
 
-// Milestone Timeline Steps Calculator
-const getTimelineSteps = (order: any) => {
-  const isPickup = order?.delivery_address?.toLowerCase().includes("self-pickup");
+// Status and milestone calculator matching Track Order workflow exactly:
+// 1. Pickup Warehouse:
+//    - Ready to Pick in Track Order -> Packing Cartons (Step 3)
+//    - Ready to Deliver in Track Order -> Ready for Pickup (Step 4)
+//    - Delivered in Track Order -> Collected (Step 5)
+// 2. Deliver Doorstep:
+//    - Ready to Pick & Ready to Deliver in Track Order -> Packing Cartons (Step 3)
+//    - Out for Delivery in Track Order -> Out for Delivery (Step 4)
+//    - Delivered in Track Order -> Delivered (Step 5)
+export const getOrderStatusInfo = (order: any) => {
+  const isPickup = Boolean(
+    order?.delivery_address?.toLowerCase().includes("self-pickup") ||
+    order?.deliver_method?.toLowerCase().includes("pickup") ||
+    order?.delivery_method?.toLowerCase().includes("pickup")
+  );
   const isPaid = order?.payment_status === "verified";
-  const fulfillment = order?.fulfillment_status || "pending";
+  const fulfillment = String(order?.fulfillment_status || "pending").toLowerCase();
+  const trackStatus = String(order?.track_status || "").trim().toLowerCase();
+  const trackDetail = String(order?.track_detail_status || "").trim().toLowerCase();
+  const rawTrack = trackDetail || trackStatus;
+
+  const isDelivered =
+    fulfillment === "completed" ||
+    trackStatus === "delivered" ||
+    trackStatus === "collected" ||
+    trackStatus === "complete" ||
+    trackStatus === "completed" ||
+    trackDetail === "delivered" ||
+    trackDetail === "collected" ||
+    trackDetail === "complete" ||
+    trackDetail === "completed" ||
+    order?.completed === true ||
+    order?.completed === "true" ||
+    order?.track_completed === true;
 
   let currentStep = 1;
-  if (isPaid) currentStep = 2;
-  if (isPaid && (fulfillment === "packing" || fulfillment === "in_progress")) currentStep = 3;
-  if (fulfillment === "out_for_delivery" || fulfillment === "ready_for_pickup") currentStep = 4;
-  if (fulfillment === "completed") currentStep = 5;
+  let statusText = "Order Placed";
+
+  if (isPaid) {
+    currentStep = 2;
+    statusText = "Payment Verified";
+  }
+
+  if (isPaid && (fulfillment === "packing" || fulfillment === "in_progress" || order?.in_track_order || rawTrack)) {
+    currentStep = 3;
+    statusText = "Packing Cartons";
+  }
+
+  if (isPickup) {
+    // Pickup Warehouse
+    // - Ready to Pick -> Packing Cartons (Step 3)
+    if (trackStatus === "ready to pick" || trackStatus === "picking") {
+      currentStep = 3;
+      statusText = "Packing Cartons";
+    }
+    // - Ready to Deliver -> Ready for Pickup (Step 4)
+    if (trackStatus === "ready to deliver" || trackDetail === "ready to collect" || trackDetail === "ready to deliver" || fulfillment === "ready_for_pickup") {
+      currentStep = 4;
+      statusText = "Ready for Pickup";
+    }
+    // - Delivered -> Collected (Step 5)
+    if (isDelivered) {
+      currentStep = 5;
+      statusText = "Collected";
+    }
+  } else {
+    // Deliver Doorstep
+    // - Ready to Pick & Ready to Deliver -> Packing Cartons (Step 3)
+    if (trackStatus === "ready to pick" || trackStatus === "ready to deliver" || trackStatus === "picking" || trackDetail === "ready to deliver") {
+      currentStep = 3;
+      statusText = "Packing Cartons";
+    }
+    // - Out for Delivery -> Out for Delivery (Step 4)
+    if (trackStatus === "out for delivery" || trackDetail === "out for delivery" || fulfillment === "out_for_delivery") {
+      currentStep = 4;
+      statusText = "Out for Delivery";
+    }
+    // - Delivered -> Delivered (Step 5)
+    if (isDelivered) {
+      currentStep = 5;
+      statusText = "Delivered";
+    }
+  }
+
+  return {
+    isPickup,
+    isPaid,
+    isDelivered,
+    currentStep,
+    statusText,
+    trackStatus,
+    trackDetail,
+    rawTrack
+  };
+};
+
+// Milestone Timeline Steps Calculator
+const getTimelineSteps = (order: any) => {
+  const { isPickup, isPaid, isDelivered, currentStep, trackStatus } = getOrderStatusInfo(order);
 
   return [
     {
@@ -396,30 +488,34 @@ const getTimelineSteps = (order: any) => {
       desc: isPaid
         ? (order.payment_verified_at ? `Verified ${new Date(order.payment_verified_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : "PayNow confirmed")
         : "Awaiting verification",
-      done: isPaid,
-      active: !isPaid
+      done: isPaid || currentStep >= 2,
+      active: currentStep === 2
     },
     {
       step: 3,
       title: "Packing Cartons",
-      desc: isPaid ? (currentStep > 3 ? "Packed & sealed" : "Warehouse packing") : "Queueing",
-      done: currentStep > 3,
-      active: isPaid && currentStep === 3
+      desc: isPaid
+        ? (currentStep > 3 || (!isPickup && trackStatus === "ready to deliver")
+            ? "Packed & sealed"
+            : "Team packing")
+        : "Queueing",
+      done: currentStep >= 3,
+      active: currentStep === 3
     },
     {
       step: 4,
       title: isPickup ? "Ready for Pickup" : "Out for Delivery",
       desc: isPickup
-        ? (currentStep >= 4 ? "Ready at Eunos" : "Warehouse processing")
+        ? (currentStep >= 4 ? "Ready with us" : "Team processing")
         : (currentStep >= 4 ? "Driver dispatched" : "Awaiting dispatch"),
-      done: currentStep > 4,
+      done: currentStep >= 4,
       active: currentStep === 4
     },
     {
       step: 5,
       title: isPickup ? "Collected" : "Delivered",
-      desc: fulfillment === "completed" ? "Order completed" : (isPickup ? "Awaiting collection" : "Estimated 2-3 days"),
-      done: fulfillment === "completed",
+      desc: isDelivered ? "Order completed" : (isPickup ? "Awaiting collection" : "Estimated 2-3 days"),
+      done: isDelivered || currentStep >= 5,
       active: currentStep === 5
     }
   ];
@@ -686,6 +782,7 @@ export default function App() {
   const [thankYouOrder, setThankYouOrder] = useState<any | null>(null);
   const [thankYouLoading, setThankYouLoading] = useState<boolean>(false);
   const [thankYouCopied, setThankYouCopied] = useState<boolean>(false);
+  const [receiptQrModalOrderRef, setReceiptQrModalOrderRef] = useState<string | null>(null);
 
   // Customer Form with localStorage persistence
   const COUNTRY_CODES = ["+65", "+60", "+91", "+62", "+63", "+880", "+84", "+66", "+86"];
@@ -794,19 +891,9 @@ export default function App() {
 
   // WhatsApp Customer Auth & Order History States
   const [authCustomerPhone, setAuthCustomerPhone] = useState<string>(() => {
-    const normPath = window.location.pathname.toLowerCase().replace(/\/$/, "");
-    const params = new URLSearchParams(window.location.search);
-    if (normPath.startsWith("/track") || params.get("track") || params.get("ref")) {
-      return "";
-    }
     try { return localStorage.getItem("hsg_auth_phone") || ""; } catch { return ""; }
   });
   const [authCustomerName, setAuthCustomerName] = useState<string>(() => {
-    const normPath = window.location.pathname.toLowerCase().replace(/\/$/, "");
-    const params = new URLSearchParams(window.location.search);
-    if (normPath.startsWith("/track") || params.get("track") || params.get("ref")) {
-      return "";
-    }
     try { return localStorage.getItem("hsg_auth_name") || ""; } catch { return ""; }
   });
   const [loginModalOpen, setLoginModalOpen] = useState<boolean>(false);
@@ -821,7 +908,9 @@ export default function App() {
   const [verifyOwnerModalOpen, setVerifyOwnerModalOpen] = useState<boolean>(false);
   const [verifyDigits, setVerifyDigits] = useState<string[]>(["", "", "", ""]);
   const [verifyError, setVerifyError] = useState<string>("");
-  const [isTrackOwnerVerified, setIsTrackOwnerVerified] = useState<boolean>(false);
+  const [isTrackOwnerVerified, setIsTrackOwnerVerified] = useState<boolean>(() => {
+    try { return Boolean(localStorage.getItem("hsg_auth_phone")); } catch { return false; }
+  });
   const [verifyLockoutUntil, setVerifyLockoutUntil] = useState<number>(() => {
     try {
       const saved = Number(localStorage.getItem("hsg_verify_lockout_until") || "0");
@@ -861,7 +950,7 @@ export default function App() {
     return () => clearInterval(timer);
   }, [verifyLockoutUntil]);
 
-  const handleVerifyOwnerSubmit = (digitsToVerify?: string[]) => {
+  const handleVerifyOwnerSubmit = async (digitsToVerify?: string[]) => {
     if (verifyLockoutUntil > Date.now()) return;
     const digits = digitsToVerify || verifyDigits;
     const entered = digits.join("").trim();
@@ -869,28 +958,50 @@ export default function App() {
       setVerifyError("Please enter all 4 digits.");
       return;
     }
-    const actualLast4 = (trackedOrder?.customer_phone || "").replace(/\D/g, "").slice(-4);
-    if (actualLast4 && entered === actualLast4) {
-      setVerifyError("");
-      setIsTrackOwnerVerified(true);
-      setVerifyOwnerModalOpen(false);
-      setVerifyDigits(["", "", "", ""]);
-      const p = trackedOrder.customer_phone;
-      const n = trackedOrder.customer_name || "";
-      setAuthCustomerPhone(p);
-      if (n) setAuthCustomerName(n);
-      setOrderHistoryModalOpen(true);
-      fetchPastOrders(p);
-    } else {
-      const lockUntil = Date.now() + 5 * 60 * 1000;
-      setVerifyLockoutUntil(lockUntil);
-      setVerifyLockoutRemainingSec(300);
-      setVerifyDigits(["", "", "", ""]);
-      setVerifyError("Incorrect last 4 digits. Please wait 5 minutes to try again.");
-      try {
-        localStorage.setItem("hsg_verify_lockout_until", String(lockUntil));
-      } catch {}
+
+    try {
+      const res = await fetch(`${WORKER_URL}/api/shop/verify-order-owner`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          order_ref: trackedOrder?.order_ref,
+          last4: entered
+        })
+      });
+      const data = await res.json();
+      if (res.ok && data.success && data.customer_phone) {
+        setVerifyError("");
+        setIsTrackOwnerVerified(true);
+        setVerifyOwnerModalOpen(false);
+        setVerifyDigits(["", "", "", ""]);
+        const p = data.customer_phone;
+        const n = data.customer_name || "";
+        setAuthCustomerPhone(p);
+        if (n) setAuthCustomerName(n);
+        try {
+          localStorage.setItem("hsg_auth_phone", p);
+          if (n) localStorage.setItem("hsg_auth_name", n);
+          if (!phoneBody) {
+            const cleanBody = p.replace(/^\+?65/, "");
+            setPhoneBody(cleanBody);
+          }
+        } catch (e) {}
+        setOrderHistoryModalOpen(true);
+        fetchPastOrders(p);
+        return;
+      }
+    } catch (err) {
+      console.error("Owner verification failed", err);
     }
+
+    const lockUntil = Date.now() + 5 * 60 * 1000;
+    setVerifyLockoutUntil(lockUntil);
+    setVerifyLockoutRemainingSec(300);
+    setVerifyDigits(["", "", "", ""]);
+    setVerifyError("Phone Number Incorrect");
+    try {
+      localStorage.setItem("hsg_verify_lockout_until", String(lockUntil));
+    } catch {}
   };
 
   const handleOpenLogin = async () => {
@@ -1070,6 +1181,13 @@ export default function App() {
   const loadThankYouOrder = async (ref: string) => {
     setThankYouLoading(true);
     try {
+      // Fix 3: Trigger WhatsApp & Email notifications once the user reaches the Thank You page
+      fetch(`${WORKER_URL}/api/shop/orders/confirm-notify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ order_ref: ref })
+      }).catch(() => {});
+
       const res = await fetch(`${WORKER_URL}/api/shop/order-status?ref=${encodeURIComponent(ref)}`);
       if (res.ok) {
         const data = await res.json();
@@ -1102,9 +1220,14 @@ export default function App() {
     return () => clearInterval(interval);
   }, [thankYouOrder]);
 
-  // Auto-poll tracked order status if payment is not yet verified
+  // Auto-poll tracked order status until fulfillment is completed or cancelled
   useEffect(() => {
-    if (!trackedOrder || trackedOrder.payment_status === "verified") return;
+    if (!trackedOrder) return;
+    const { isDelivered } = getOrderStatusInfo(trackedOrder);
+    const isCancelled =
+      trackedOrder.fulfillment_status === "cancelled" ||
+      trackedOrder.payment_status === "cancelled";
+    if (isDelivered || isCancelled) return;
 
     const interval = setInterval(() => {
       fetch(`${WORKER_URL}/api/shop/order-status?ref=${encodeURIComponent(trackedOrder.order_ref)}`)
@@ -1401,10 +1524,26 @@ export default function App() {
     const hasName = customerName.trim().length > 0;
     const cleanPhone = phoneBody.replace(/[^0-9]/g, "");
     const hasPhone = cleanPhone.length >= 8;
+    const hasEmail = customerEmail.trim().length > 0 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customerEmail.trim());
     const isPickup = deliveryMethod === "pickup";
     const hasAddress = isPickup || (postalCode.trim().length >= 6 && deliveryAddress.trim().length > 0);
-    return hasName && hasPhone && hasAddress && canPayNowTick;
-  }, [customerName, phoneBody, deliveryMethod, postalCode, deliveryAddress, canPayNowTick, isOrderExceedingLimit]);
+    return hasName && hasPhone && hasEmail && hasAddress && canPayNowTick;
+  }, [customerName, phoneBody, customerEmail, deliveryMethod, postalCode, deliveryAddress, canPayNowTick, isOrderExceedingLimit]);
+
+  const handleOpenWhatsAppReceipt = (orderRef: string) => {
+    const rawTarget = settings?.meta_whatsapp_phone || "6584755948";
+    const cleanTarget = rawTarget.replace(/\D/g, "");
+    const finalPhone = cleanTarget.length === 8 ? `65${cleanTarget}` : (cleanTarget || "6584755948");
+    const msgText = `Hi HSG Global,\nhere my payment receipt for order #${orderRef}\n👇`;
+    const waMobileUrl = `https://wa.me/${finalPhone}?text=${encodeURIComponent(msgText)}`;
+
+    const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 640;
+    if (isMobile) {
+      window.location.href = waMobileUrl;
+    } else {
+      setReceiptQrModalOrderRef(orderRef);
+    }
+  };
 
   // Add Standard Carton to Cart
   const handleAddStandardCarton = (product: Product) => {
@@ -1691,19 +1830,9 @@ export default function App() {
     }
   };
 
-  // Auto-Expire Action on 00:00 (Opens popup while keeping QR code page blurred in background)
-  const handleExpirePayment = async () => {
-    const orderToCancel = createdOrder?.order_ref;
+  // Auto-Expire Action on 00:00 (Opens popup while keeping order safely pending in Supabase)
+  const handleExpirePayment = () => {
     setExpirePopupOpen(true);
-    if (orderToCancel) {
-      try {
-        await fetch(`${WORKER_URL}/api/shop/orders?ref=${encodeURIComponent(orderToCancel)}`, {
-          method: "DELETE"
-        });
-      } catch (e) {
-        console.warn("Failed to delete order on expire", e);
-      }
-    }
   };
 
   // User clicked "I have already paid" -> Transition directly to Thank You / Order Confirmation page
@@ -2172,14 +2301,25 @@ export default function App() {
                     Your Order Is Confirmed!
                   </h1>
                   <p className="text-xs sm:text-sm text-zinc-500 leading-relaxed max-w-sm mx-auto">
-                    We have received your order details. Our warehouse team is packing and preparing your cartons.
+                    We have received your order details. Our team is packing and preparing your cartons.
                   </p>
                 </div>
               </div>
 
               {/* BOTTOM ZONE: Pinned at bottom */}
               <div className="w-full flex flex-col items-center space-y-3 shrink-0">
-                <div className="w-full space-y-2">
+                <div className="w-full space-y-2.5">
+                  {!isVerified && (
+                    <button
+                      type="button"
+                      onClick={() => handleOpenWhatsAppReceipt(thankYouOrder.order_ref)}
+                      className="w-full h-12 rounded-xl sm:rounded-2xl bg-[#25D366] hover:bg-[#20bd5a] text-white font-bold text-xs sm:text-sm inline-flex items-center justify-center gap-2 shadow-xs transition-transform active:scale-98 cursor-pointer"
+                    >
+                      <MessageCircle size={18} />
+                      <span>Send Payment Receipt via WhatsApp</span>
+                    </button>
+                  )}
+
                   <button
                     type="button"
                     onClick={() => {
@@ -2199,7 +2339,7 @@ export default function App() {
                   </button>
 
                   <p className="text-[11px] text-zinc-400 text-center">
-                    View live order status and receipt anytime.
+                    {!isVerified ? "Please send your PayNow transfer receipt on WhatsApp to verify payment." : "View live order status and receipt anytime."}
                   </p>
                 </div>
 
@@ -2263,7 +2403,8 @@ export default function App() {
         }
 
         const isVerified = trackedOrder.payment_status === "verified";
-        const isPickup = trackedOrder.delivery_address?.toLowerCase().includes("self-pickup");
+        const statusInfo = getOrderStatusInfo(trackedOrder);
+        const isPickup = statusInfo.isPickup;
         const timelineSteps = getTimelineSteps(trackedOrder);
 
         // Calculate BCRS deposit ($0.10 per beverage container)
@@ -2342,8 +2483,14 @@ export default function App() {
                     <button
                       type="button"
                       onClick={() => {
-                        if (isTrackOwnerVerified) {
-                          const p = trackedOrder.customer_phone || authCustomerPhone;
+                        const savedPhone = authCustomerPhone || (() => {
+                          try { return localStorage.getItem("hsg_auth_phone") || ""; } catch { return ""; }
+                        })();
+
+                        if (isTrackOwnerVerified || savedPhone) {
+                          const p = savedPhone || trackedOrder?.customer_phone;
+                          if (!authCustomerPhone && p) setAuthCustomerPhone(p);
+                          setIsTrackOwnerVerified(true);
                           setOrderHistoryModalOpen(true);
                           if (p) fetchPastOrders(p);
                         } else {
@@ -2390,7 +2537,7 @@ export default function App() {
                         <div
                           className={`w-8 h-8 sm:w-9 sm:h-9 rounded-full flex items-center justify-center font-bold text-xs transition-all z-10 ${
                             s.done
-                              ? "bg-[#0B57D0] text-white shadow-xs"
+                              ? `bg-[#0B57D0] text-white shadow-xs ${s.active ? "ring-4 ring-blue-100 ring-offset-1" : ""}`
                               : s.active
                               ? "bg-blue-100 text-[#0B57D0] ring-4 ring-blue-50 font-black"
                               : "bg-slate-100 text-zinc-400 border border-slate-200"
@@ -2426,16 +2573,63 @@ export default function App() {
                 </div>
 
                 {/* Status Message Banner */}
-                <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-3.5 flex items-start gap-3 text-xs">
-                  <Info size={16} className="text-[#0B57D0] shrink-0 mt-0.5" />
-                  <div className="space-y-0.5">
-                    <div className="font-bold text-zinc-900">Current Status Update</div>
-                    <p className="text-zinc-600 leading-relaxed">
-                      {isVerified
-                        ? `Payment confirmed! Our Singapore warehouse at 9 Eunos Ave 8A is packing your carton items for ${isPickup ? "self-pickup collection" : "doorstep delivery dispatch"}.`
-                        : "We are verifying your PayNow transfer reference. As soon as verification is confirmed, your status will update automatically."}
-                    </p>
+                <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-3.5 flex flex-col gap-2.5 text-xs">
+                  <div className="flex items-start gap-3">
+                    <Info size={16} className="text-[#0B57D0] shrink-0 mt-0.5" />
+                    <div className="space-y-0.5 flex-1">
+                      <div className="font-bold text-zinc-900 flex items-center gap-1.5 flex-wrap">
+                        <span>Current Status:</span>
+                        <span className="font-extrabold text-[#0B57D0] bg-blue-50 px-2 py-0.5 rounded-full border border-blue-200/80 text-[11px]">
+                          {statusInfo.statusText}
+                        </span>
+                        {!isVerified && (
+                          <span className="text-[11px] font-semibold text-red-600">
+                            Pending Verify Payment
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-zinc-600 leading-relaxed pt-0.5">
+                        {(() => {
+                          if (!isVerified) {
+                            return "We are verifying your PayNow transfer reference. As soon as verification is confirmed, your status will update automatically.";
+                          }
+                          if (statusInfo.isDelivered) {
+                            return isPickup
+                              ? "Your order has been collected from us. Thank you for shopping with HSG Global!"
+                              : "Your order has been safely delivered to your doorstep. Thank you for shopping with HSG Global!";
+                          }
+                          if (statusInfo.currentStep === 4) {
+                            return isPickup
+                              ? "Your cartons are packed and ready for self-pickup from us. Please quote your order ref upon collection."
+                              : "Your cartons have been loaded and dispatched with our driver. Delivery is in progress!";
+                          }
+                          if (statusInfo.currentStep === 3) {
+                            const isPacked = statusInfo.trackStatus === "ready to deliver";
+                            return isPacked && !isPickup
+                              ? "Your carton items are packed & sealed by our team, awaiting driver dispatch."
+                              : `Payment confirmed! Our team is packing your carton items for ${isPickup ? "self-pickup collection" : "doorstep delivery dispatch"}.`;
+                          }
+                          return `Payment confirmed! Order queued for our team to process.`;
+                        })()}
+                      </p>
+                    </div>
                   </div>
+
+                  {!isVerified && (
+                    <div className="pt-2.5 border-t border-slate-200/80 flex flex-col sm:flex-row items-center justify-between gap-2.5">
+                      <span className="text-[11px] text-zinc-500 text-center sm:text-left">
+                        Paid via PayNow? Send receipt screenshot via WhatsApp to confirm faster:
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => handleOpenWhatsAppReceipt(trackedOrder.order_ref)}
+                        className="h-8 px-3.5 rounded-xl bg-[#25D366] hover:bg-[#20bd5a] text-white font-bold text-xs inline-flex items-center gap-1.5 shadow-2xs transition-transform active:scale-98 cursor-pointer shrink-0"
+                      >
+                        <MessageCircle size={14} />
+                        <span>Send Receipt via WhatsApp</span>
+                      </button>
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -2446,15 +2640,15 @@ export default function App() {
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-200 pb-5">
                   <div className="space-y-1">
                     <div className="font-black text-lg sm:text-xl text-zinc-950 tracking-tight flex items-center gap-2">
-                      <span>HSG GLOBAL PTE. LTD.</span>
+                      <span>{settings.company_name || "HSG GLOBAL PTE. LTD."}</span>
                       <span className="text-[10px] bg-slate-100 text-zinc-600 px-2 py-0.5 rounded-full font-mono font-bold">
                         OFFICIAL RECEIPT
                       </span>
                     </div>
                     <div className="text-xs text-zinc-500 space-y-0.5">
-                      <p>UEN: <strong>202301234K</strong> • Registered in Singapore</p>
-                      <p>Warehouse: 9 Eunos Ave 8A, Eunos Industrial Estate, Singapore 409461</p>
-                      <p>Support: sales@hsgglobal.sg</p>
+                      <p>UEN: <strong>{settings.company_uen || "201627632D"}</strong> • Registered in Singapore</p>
+                      <p>Warehouse: {settings.warehouse_address || "9 Eunos Ave 8A, Eunos Industrial Estate, Singapore 409461"}</p>
+                      <p>Support: {settings.support_email || "sales@hsg-global.com"}</p>
                     </div>
                   </div>
 
@@ -2546,17 +2740,25 @@ export default function App() {
                       </span>
                       <span className="font-bold text-zinc-800">Singapore PayNow SGQR</span>
                     </div>
-                    <div className="flex items-center gap-2">
-                      <span className="text-zinc-500 text-xs">Payment Status:</span>
-                      <span
-                        className={`font-bold px-2.5 py-0.5 rounded-full text-xs ${
-                          isVerified
-                            ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
-                            : "bg-amber-50 text-amber-800 border border-amber-200"
-                        }`}
-                      >
-                        {isVerified ? "Verified / Paid" : "Pending Verification"}
-                      </span>
+                    <div className="flex items-center gap-3 flex-wrap">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-zinc-500 text-xs">Payment:</span>
+                        <span
+                          className={`font-bold px-2.5 py-0.5 rounded-full text-xs ${
+                            isVerified
+                              ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                              : "bg-amber-50 text-amber-800 border border-amber-200"
+                          }`}
+                        >
+                          {isVerified ? "Verified / Paid" : "Pending Verification"}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-zinc-500 text-xs">Status:</span>
+                        <span className="font-bold px-2.5 py-0.5 rounded-full text-xs bg-blue-50 text-[#0B57D0] border border-blue-200">
+                          {statusInfo.statusText}
+                        </span>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -3783,14 +3985,18 @@ export default function App() {
                       </div>
                     </div>
                     <div>
-                      <label className="font-semibold text-zinc-700 block mb-1">Email (Optional)</label>
+                      <label className="font-semibold text-zinc-700 block mb-1">
+                        Email Address <span className="text-red-500">*</span>
+                      </label>
                       <input
                         type="email"
+                        required
                         placeholder="alex@gmail.com"
                         value={customerEmail}
                         onChange={(e) => setCustomerEmail(e.target.value)}
                         className="w-full px-3.5 py-2.5 bg-white border border-slate-300 rounded-xl text-xs focus:ring-1 focus:ring-[#0B57D0] focus:border-[#0B57D0]"
                       />
+                      <p className="text-[10px] text-zinc-400 mt-1">Official order confirmation and digital receipt will be sent here.</p>
                     </div>
                   </div>
                 </div>
@@ -4260,16 +4466,25 @@ export default function App() {
             </div>
 
             <div>
-              <h3 className="text-base font-extrabold text-zinc-950">Payment Session Expired</h3>
+              <h3 className="text-base font-extrabold text-zinc-950">Payment QR Expired</h3>
               <p className="text-xs text-zinc-600 mt-2 leading-relaxed">
-                The 5-minute payment window has expired and this order was canceled.
-              </p>
-              <p className="text-[11px] text-zinc-400 mt-1.5">
-                Click OK to review your details and generate a fresh QR code.
+                The 5-minute QR window has timed out. If you have already transferred the money in your banking app, send your receipt via WhatsApp to confirm your order.
               </p>
             </div>
 
-            <div className="pt-2">
+            <div className="pt-2 space-y-2">
+              {createdOrder?.order_ref && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    handleOpenWhatsAppReceipt(createdOrder.order_ref);
+                  }}
+                  className="w-full h-11 bg-[#25D366] hover:bg-[#20bd5a] text-white rounded-xl text-xs font-bold inline-flex items-center justify-center gap-1.5 transition-all cursor-pointer shadow-xs active:scale-98"
+                >
+                  <MessageCircle size={15} />
+                  <span>Already Paid? Send Receipt via WhatsApp</span>
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => {
@@ -4278,9 +4493,9 @@ export default function App() {
                   clearPaymentSession();
                   setCheckoutModalOpen(true);
                 }}
-                className="w-full h-10 bg-zinc-800 hover:bg-zinc-900 text-white rounded-xl text-xs font-bold transition-all cursor-pointer shadow-xs active:scale-98"
+                className="w-full h-10 bg-slate-100 hover:bg-slate-200 text-zinc-700 rounded-xl text-xs font-bold transition-all cursor-pointer shadow-xs active:scale-98"
               >
-                OK
+                Generate Fresh QR Code
               </button>
             </div>
           </div>
@@ -4486,6 +4701,72 @@ export default function App() {
       )}
 
       {/* ========================================================= */}
+      {/* WHATSAPP RECEIPT QR MODAL (DESKTOP)                       */}
+      {/* ========================================================= */}
+      {receiptQrModalOrderRef && (() => {
+        const rawTarget = settings?.meta_whatsapp_phone || "6584755948";
+        const cleanTarget = rawTarget.replace(/\D/g, "");
+        const finalPhone = cleanTarget.length === 8 ? `65${cleanTarget}` : (cleanTarget || "6584755948");
+        const msgText = `Hi HSG Global,\nhere my payment receipt for order #${receiptQrModalOrderRef}\n👇`;
+        const waMobileUrl = `https://wa.me/${finalPhone}?text=${encodeURIComponent(msgText)}`;
+        const waWebUrl = `https://web.whatsapp.com/send?phone=${finalPhone}&text=${encodeURIComponent(msgText)}`;
+
+        return (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4 animate-in fade-in duration-150">
+            <div className="bg-white rounded-3xl border border-slate-200 max-w-sm w-full shadow-2xl overflow-hidden animate-in zoom-in-95 duration-150 text-center">
+              {/* Header */}
+              <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+                <div className="flex items-center gap-2.5 text-left">
+                  <div className="w-8 h-8 rounded-full bg-emerald-50 text-[#25D366] flex items-center justify-center shrink-0">
+                    <MessageCircle size={16} />
+                  </div>
+                  <div>
+                    <h3 className="font-extrabold text-sm text-zinc-950">Send Payment Receipt</h3>
+                    <p className="text-[11px] text-zinc-500 font-mono">Order #{receiptQrModalOrderRef}</p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setReceiptQrModalOrderRef(null)}
+                  className="w-7 h-7 rounded-full text-zinc-400 hover:text-zinc-600 hover:bg-slate-100 flex items-center justify-center transition-colors cursor-pointer"
+                >
+                  <X size={16} />
+                </button>
+              </div>
+
+              {/* Body */}
+              <div className="p-6 flex flex-col items-center space-y-4">
+                <div className="p-3 bg-white rounded-2xl border border-slate-200 shadow-xs inline-block">
+                  <QRCodeCanvas value={waMobileUrl} size={170} level="M" />
+                </div>
+
+                <div className="space-y-1 max-w-xs">
+                  <p className="text-xs font-bold text-zinc-900">
+                    Scan with your phone camera
+                  </p>
+                  <p className="text-[11px] text-zinc-500 leading-relaxed">
+                    This opens WhatsApp with your order reference pre-filled so you can easily send your PayNow transfer receipt.
+                  </p>
+                </div>
+
+                <div className="w-full pt-1 border-t border-slate-100">
+                  <a
+                    href={waWebUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="w-full h-10 rounded-xl bg-slate-100 hover:bg-slate-200 text-zinc-800 font-bold text-xs inline-flex items-center justify-center gap-2 transition-colors cursor-pointer"
+                  >
+                    <ExternalLink size={13} />
+                    <span>Open in WhatsApp Web</span>
+                  </a>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ========================================================= */}
       {/* VERIFY ORDER OWNER (4-DIGIT PHONE) MODAL                  */}
       {/* ========================================================= */}
       {verifyOwnerModalOpen && (
@@ -4638,6 +4919,13 @@ export default function App() {
               </div>
               <div className="flex items-center gap-2">
                 <button
+                  onClick={handleLogout}
+                  className="px-2 py-1 text-[11px] font-semibold text-zinc-500 hover:text-rose-600 hover:bg-slate-100 rounded-md transition-colors cursor-pointer"
+                  title="Log out of this phone"
+                >
+                  Log out
+                </button>
+                <button
                   onClick={() => fetchPastOrders(authCustomerPhone)}
                   className="p-1.5 hover:bg-slate-100 rounded-lg text-zinc-500 hover:text-zinc-800 transition-colors cursor-pointer"
                   title="Refresh orders"
@@ -4673,8 +4961,7 @@ export default function App() {
                 </div>
               ) : (
                 pastOrders.map((ord: any) => {
-                  const isVerified = ord.payment_status === "verified";
-                  const isPickup = (ord.delivery_address || "").toLowerCase().includes("self-pickup");
+                  const statusInfo = getOrderStatusInfo(ord);
                   const dateStr = ord.created_at
                     ? new Date(Number(ord.created_at)).toLocaleDateString("en-GB", {
                         day: "numeric",
@@ -4685,97 +4972,55 @@ export default function App() {
                       })
                     : "";
 
+                  const badgeClass =
+                    statusInfo.currentStep === 5
+                      ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                      : statusInfo.currentStep >= 2
+                      ? "bg-blue-50 text-[#0B57D0] border-blue-200/80"
+                      : "bg-slate-100 text-zinc-600 border-slate-200";
+
                   return (
                     <div
                       key={ord.id}
-                      className="bg-white rounded-xl border border-slate-200 p-4 hover:border-slate-300 transition-colors shadow-2xs space-y-3"
+                      className="bg-white rounded-xl border border-slate-200 p-3.5 sm:p-4 hover:border-slate-300 transition-colors shadow-2xs flex flex-col sm:flex-row sm:items-center justify-between gap-3"
                     >
-                      {/* Top Row: Ref, Date, Badges */}
-                      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-2.5">
-                        <div className="flex items-center gap-2">
-                          <span className="font-mono font-extrabold text-xs text-zinc-950">
+                      {/* Left: Ref, Status, Date */}
+                      <div className="space-y-1 min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="font-mono font-extrabold text-xs sm:text-sm text-zinc-950">
                             {ord.order_ref}
                           </span>
-                          <span className="text-[11px] text-zinc-400">•</span>
-                          <span className="text-[11px] text-zinc-500">{dateStr}</span>
-                        </div>
-                        <div className="flex items-center gap-1.5">
-                          {/* Payment status badge */}
-                          {isVerified ? (
-                            <span className="inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
-                              <CheckCircle2 size={11} />
-                              Paid
-                            </span>
-                          ) : (
-                            <span className="inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200">
-                              <Clock size={11} />
-                              Awaiting PayNow
+                          <span className={`inline-flex items-center text-[10px] sm:text-[11px] font-bold px-2.5 py-0.5 rounded-full border ${badgeClass}`}>
+                            {statusInfo.statusText}
+                          </span>
+                          {statusInfo.statusText === "Order Placed" && !statusInfo.isPaid && (
+                            <span className="text-[10px] sm:text-[11px] font-semibold text-red-600">
+                              Pending Verify Payment
                             </span>
                           )}
-
-                          {/* Fulfillment status badge */}
-                          <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-100 text-zinc-700 border border-slate-200">
-                            {ord.fulfillment_status === "completed"
-                              ? (isPickup ? "Collected" : "Delivered")
-                              : ord.fulfillment_status === "out_for_delivery"
-                              ? "Out for Delivery"
-                              : ord.fulfillment_status === "packing"
-                              ? "Packing Cartons"
-                              : isPickup
-                              ? "Ready for Self-Pickup"
-                              : "Order Received"}
-                          </span>
+                        </div>
+                        <div className="text-[11px] text-zinc-500">
+                          {dateStr}
                         </div>
                       </div>
 
-                      {/* Middle Row: Items & Delivery Info */}
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
-                        <div>
-                          <div className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider mb-1">
-                            Cartons ({ord.total_cartons} CTN)
-                          </div>
-                          <div className="space-y-0.5 max-h-20 overflow-y-auto pr-1">
-                            {ord.items && ord.items.length > 0 ? (
-                              ord.items.map((it: any, iIdx: number) => (
-                                <div key={iIdx} className="text-zinc-700 text-[11px] truncate">
-                                  {it.carton_qty}x {it.name}
-                                </div>
-                              ))
-                            ) : (
-                              <div className="text-zinc-500 text-[11px]">{ord.total_cartons} cartons</div>
-                            )}
-                          </div>
-                        </div>
-
-                        <div>
-                          <div className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider mb-1">
-                            {isPickup ? "Self-Pickup" : "Delivery Address"}
-                          </div>
-                          <div className="text-zinc-700 text-[11px] line-clamp-2">
-                            {isPickup
-                              ? "Warehouse: 9 Eunos Ave 8A, Singapore 409461"
-                              : `${ord.delivery_address || ""} ${ord.unit_no || ""} (S${ord.postal_code || ""})`}
-                          </div>
-                          <div className="text-base font-black text-zinc-950 mt-1">
+                      {/* Right: Amount & Button to See More */}
+                      <div className="flex items-center justify-between sm:justify-end gap-3.5 pt-2 sm:pt-0 border-t sm:border-t-0 border-slate-100 shrink-0">
+                        <div className="text-left sm:text-right">
+                          <div className="text-xs sm:text-sm font-black text-zinc-950">
                             SGD ${Number(ord.total_amount).toFixed(2)}
                           </div>
                         </div>
-                      </div>
 
-                      {/* Bottom Row Action */}
-                      <div className="pt-2 border-t border-slate-100 flex items-center justify-between">
-                        <span className="text-[11px] text-zinc-400">
-                          {isPickup ? "Self-Pickup order" : "Doorstep Delivery"}
-                        </span>
                         <button
                           onClick={() => {
                             setOrderHistoryModalOpen(false);
                             navigateTo(`/track?ref=${ord.order_ref}`);
                             loadTrackedOrder(ord.order_ref);
                           }}
-                          className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#0B57D0] hover:bg-[#0842A0] text-white rounded-lg text-xs font-bold transition-colors cursor-pointer"
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#0B57D0] hover:bg-[#0842A0] text-white rounded-lg text-xs font-bold transition-all active:scale-95 cursor-pointer shadow-2xs shrink-0"
                         >
-                          View Order & Receipt
+                          <span>See More</span>
                           <ArrowRight size={13} />
                         </button>
                       </div>
