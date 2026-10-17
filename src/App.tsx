@@ -31,10 +31,12 @@ import {
   MessageSquare,
   MessageCircle,
   Printer,
-  FileText
+  FileText,
+  XCircle
 } from "lucide-react";
 import { QRCodeCanvas } from "qrcode.react";
 import { DotLottieReact } from "@lottiefiles/dotlottie-react";
+import { toPng } from "html-to-image";
 
 const WORKER_URL = "https://ib-v2.hsgglobalpteltd.workers.dev";
 
@@ -122,8 +124,21 @@ interface ShopSettings {
   pickup_hours?: string;
   allow_self_pickup?: boolean;
   show_hero_section?: boolean;
+  max_order_cartons?: number;
   max_order_amount?: number;
   meta_whatsapp_phone?: string;
+  cart_upsell_enabled?: boolean;
+  cart_upsell_title?: string;
+  cart_upsell_subtitle?: string;
+  cart_upsell_items?: CartUpsellItem[];
+}
+
+export interface CartUpsellItem {
+  sku: string;
+  display_name: string;
+  image: string;
+  price_per_piece: number;
+  max_qty: number;
 }
 
 // Carton Size Group for Custom Mix Builder
@@ -388,10 +403,24 @@ export const getOrderStatusInfo = (order: any) => {
     order?.delivery_method?.toLowerCase().includes("pickup")
   );
   const isPaid = order?.payment_status === "verified";
-  const fulfillment = String(order?.fulfillment_status || "pending").toLowerCase();
+  const paymentStatus = String(order?.payment_status || "").toLowerCase().trim();
+  const fulfillment = String(order?.fulfillment_status || "pending").toLowerCase().trim();
   const trackStatus = String(order?.track_status || "").trim().toLowerCase();
   const trackDetail = String(order?.track_detail_status || "").trim().toLowerCase();
   const rawTrack = trackDetail || trackStatus;
+
+  const isVoid =
+    paymentStatus === "rejected" ||
+    paymentStatus === "cancelled" ||
+    paymentStatus === "void" ||
+    fulfillment === "cancelled" ||
+    fulfillment === "void";
+
+  let rejectReason = "";
+  if (order?.payment_verified_by && String(order.payment_verified_by).includes("Rejected:")) {
+    const match = String(order.payment_verified_by).match(/Rejected:\s*([^)]+)/i);
+    if (match) rejectReason = match[1].trim();
+  }
 
   const isDelivered =
     fulfillment === "completed" ||
@@ -406,6 +435,21 @@ export const getOrderStatusInfo = (order: any) => {
     order?.completed === true ||
     order?.completed === "true" ||
     order?.track_completed === true;
+
+  if (isVoid) {
+    return {
+      isPickup,
+      isPaid: false,
+      isDelivered: false,
+      isVoid: true,
+      rejectReason,
+      currentStep: 0,
+      statusText: "Void / Cancelled",
+      trackStatus,
+      trackDetail,
+      rawTrack
+    };
+  }
 
   let currentStep = 1;
   let statusText = "Order Placed";
@@ -460,6 +504,8 @@ export const getOrderStatusInfo = (order: any) => {
     isPickup,
     isPaid,
     isDelivered,
+    isVoid: false,
+    rejectReason: "",
     currentStep,
     statusText,
     trackStatus,
@@ -532,10 +578,10 @@ export default function App() {
     is_store_open: true,
     pause_notice_message: "We are currently preparing existing orders. Shop will reopen soon.",
     company_name: "HSG GLOBAL PTE. LTD.",
-    company_uen: "202301234K",
+    company_uen: "201627632D",
     company_address: "Singapore",
-    whatsapp_number: "+65 9123 4567",
-    support_email: "sales@hsgglobal.sg",
+    whatsapp_number: "+65 80892248",
+    support_email: "sales@hsg-global.com",
     paynow_uen: "202301234K",
     paynow_merchant_name: "HSG GLOBAL PTE LTD",
     order_ref_prefix: "HSG-",
@@ -550,7 +596,22 @@ export default function App() {
     store_person_name: "Warehouse Store Person",
     pickup_hours: "Mon - Fri: 10:00 AM - 6:00 PM",
     allow_self_pickup: true,
+    max_order_cartons: 50,
     max_order_amount: 1000,
+    hero_slides: (() => {
+      try {
+        const cached = localStorage.getItem("hsg_hero_slides");
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+        }
+      } catch {}
+      return undefined;
+    })(),
+    cart_upsell_enabled: false,
+    cart_upsell_title: "Try Something New",
+    cart_upsell_subtitle: "Add single pieces to your delivery",
+    cart_upsell_items: [],
     show_hero_section: (() => {
       try {
         const cached = localStorage.getItem("hsg_show_hero_section");
@@ -581,7 +642,31 @@ export default function App() {
     return [];
   });
 
+  // Loose add-on single pieces cart state persisted in localStorage
+  interface LooseCartItem {
+    sku: string;
+    name: string;
+    price: number;
+    image: string;
+    qty: number;
+  }
+
+  const [looseCart, setLooseCart] = useState<Record<string, LooseCartItem>>(() => {
+    try {
+      const saved = localStorage.getItem("hsg_shop_loose_cart");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (typeof parsed === "object" && parsed !== null) return parsed;
+      }
+    } catch (e) {
+      console.warn("Failed to read loose cart from localStorage", e);
+    }
+    return {};
+  });
+
   const [cartDrawerOpen, setCartDrawerOpen] = useState<boolean>(false);
+  const [clearCartPopupOpen, setClearCartPopupOpen] = useState<boolean>(false);
+  const [cartClearedToast, setCartClearedToast] = useState<boolean>(false);
   const [promoCodeInput, setPromoCodeInput] = useState<string>("");
   const [showPromoInput, setShowPromoInput] = useState<boolean>(false);
 
@@ -593,6 +678,67 @@ export default function App() {
       console.warn("Failed to persist cart to localStorage", e);
     }
   }, [cart]);
+
+  // Persist loose cart changes
+  useEffect(() => {
+    try {
+      localStorage.setItem("hsg_shop_loose_cart", JSON.stringify(looseCart));
+    } catch (e) {
+      console.warn("Failed to persist loose cart to localStorage", e);
+    }
+  }, [looseCart]);
+
+  // Loose Add-on Cart Helpers
+  const handleAddLooseItem = (upsellItem: CartUpsellItem) => {
+    const prod = products.find((p) => p.sku === upsellItem.sku);
+    const piecePrice = Number(prod?.price_per_piece ?? upsellItem.price_per_piece ?? 0);
+    const displayName = prod?.display_name || upsellItem.display_name;
+    const img = prod?.image || upsellItem.image || "";
+
+    setLooseCart((prev) => {
+      const currentQty = prev[upsellItem.sku]?.qty || 0;
+      const maxQty = upsellItem.max_qty || 6;
+      if (currentQty >= maxQty) return prev;
+      return {
+        ...prev,
+        [upsellItem.sku]: {
+          sku: upsellItem.sku,
+          name: displayName,
+          price: piecePrice,
+          image: img,
+          qty: currentQty + 1
+        }
+      };
+    });
+  };
+
+  const handleUpdateLooseQty = (sku: string, delta: number) => {
+    setLooseCart((prev) => {
+      const existing = prev[sku];
+      if (!existing) return prev;
+      const newQty = existing.qty + delta;
+      if (newQty <= 0) {
+        const next = { ...prev };
+        delete next[sku];
+        return next;
+      }
+      return {
+        ...prev,
+        [sku]: {
+          ...existing,
+          qty: Math.min(newQty, 6)
+        }
+      };
+    });
+  };
+
+  const handleRemoveLooseItem = (sku: string) => {
+    setLooseCart((prev) => {
+      const next = { ...prev };
+      delete next[sku];
+      return next;
+    });
+  };
 
   // Track footer line to dock floating cart bar directly centered on the middle line
   const footerRef = useRef<HTMLElement | null>(null);
@@ -654,16 +800,7 @@ export default function App() {
     if (settings.hero_slides && settings.hero_slides.length > 0) {
       return settings.hero_slides.slice(0, 5);
     }
-    return [
-      {
-        id: "default",
-        badge_text: "Official Direct Storefront",
-        title: "HSG GLOBAL GOODS DIRECT TO YOUR DOOR.",
-        subtitle:
-          "Enjoy wholesale direct carton pricing across our signature food, beverage & consumer goods brands. Mix any combination of varieties in a carton or buy standard cases with fast islandwide delivery.",
-        tags: ["Min. 2 Cartons", "Carton Mix & Match", "Dynamic SGQR"]
-      }
-    ];
+    return [];
   }, [settings.hero_slides]);
 
   useEffect(() => {
@@ -777,6 +914,7 @@ export default function App() {
   const [trackingOrderRef, setTrackingOrderRef] = useState<string>("");
   const [trackedOrder, setTrackedOrder] = useState<any | null>(null);
   const [trackingLoading, setTrackingLoading] = useState<boolean>(false);
+  const [downloadingReceipt, setDownloadingReceipt] = useState<boolean>(false);
 
   // Thank You / Order Complete Screen Route (e.g. /complete?ref=HSG-XXXX)
   const [thankYouOrder, setThankYouOrder] = useState<any | null>(null);
@@ -1144,6 +1282,11 @@ export default function App() {
           setSettings(data.settings);
           try {
             localStorage.setItem("hsg_show_hero_section", String(Boolean(data.settings.show_hero_section)));
+            if (Array.isArray(data.settings.hero_slides)) {
+              localStorage.setItem("hsg_hero_slides", JSON.stringify(data.settings.hero_slides));
+            } else {
+              localStorage.removeItem("hsg_hero_slides");
+            }
           } catch {}
         }
       }
@@ -1223,11 +1366,8 @@ export default function App() {
   // Auto-poll tracked order status until fulfillment is completed or cancelled
   useEffect(() => {
     if (!trackedOrder) return;
-    const { isDelivered } = getOrderStatusInfo(trackedOrder);
-    const isCancelled =
-      trackedOrder.fulfillment_status === "cancelled" ||
-      trackedOrder.payment_status === "cancelled";
-    if (isDelivered || isCancelled) return;
+    const { isDelivered, isVoid } = getOrderStatusInfo(trackedOrder);
+    if (isDelivered || isVoid) return;
 
     const interval = setInterval(() => {
       fetch(`${WORKER_URL}/api/shop/order-status?ref=${encodeURIComponent(trackedOrder.order_ref)}`)
@@ -1370,9 +1510,21 @@ export default function App() {
     return cart.reduce((sum, item) => sum + item.carton_qty, 0);
   }, [cart]);
 
-  const subtotal = useMemo(() => {
+  const cartonSubtotal = useMemo(() => {
     return cart.reduce((sum, item) => sum + item.carton_price * item.carton_qty, 0);
   }, [cart]);
+
+  const totalLoosePieces = useMemo(() => {
+    return Object.values(looseCart).reduce((sum, item) => sum + item.qty, 0);
+  }, [looseCart]);
+
+  const totalLooseAmount = useMemo(() => {
+    return Object.values(looseCart).reduce((sum, item) => sum + item.price * item.qty, 0);
+  }, [looseCart]);
+
+  const subtotal = useMemo(() => {
+    return Number((cartonSubtotal + totalLooseAmount).toFixed(2));
+  }, [cartonSubtotal, totalLooseAmount]);
 
   // Auto-Discount Calculation
   const discountInfo = useMemo(() => {
@@ -1498,8 +1650,14 @@ export default function App() {
         }
       }
     }
+    for (const li of Object.values(looseCart)) {
+      const prod = productMap.get(li.sku);
+      if (prod?.has_bcrs) {
+        bcrs += (li.qty || 0) * 0.10;
+      }
+    }
     return Number(bcrs.toFixed(2));
-  }, [cart, productMap]);
+  }, [cart, looseCart, productMap]);
 
   const deliveryFee = useMemo(() => {
     if (deliveryMethod === "pickup") return 0;
@@ -1515,8 +1673,8 @@ export default function App() {
     return Number((effectiveSubtotal + deliveryFee + totalBcrs).toFixed(2));
   }, [subtotal, discountInfo.discountAmount, deliveryFee, totalBcrs]);
 
-  const maxOrderLimit = Number(settings.max_order_amount || 1000);
-  const isOrderExceedingLimit = totalAmount > maxOrderLimit || subtotal > maxOrderLimit;
+  const maxCartonLimit = Number(settings.max_order_cartons !== undefined ? settings.max_order_cartons : 50);
+  const isOrderExceedingLimit = totalCartons > maxCartonLimit;
   const canCheckout = totalCartons >= Number(settings.min_order_cartons || 2) && !isOrderExceedingLimit && settings.is_store_open;
 
   const isCheckoutFormValid = useMemo(() => {
@@ -1542,6 +1700,20 @@ export default function App() {
       window.location.href = waMobileUrl;
     } else {
       setReceiptQrModalOrderRef(orderRef);
+    }
+  };
+
+  const handleContactSupportForVoid = (orderRef: string) => {
+    const rawTarget = settings?.meta_whatsapp_phone || settings?.whatsapp_number || "6584755948";
+    const cleanTarget = rawTarget.replace(/\D/g, "");
+    const finalPhone = cleanTarget.length === 8 ? `65${cleanTarget}` : (cleanTarget || "6584755948");
+    const msgText = `Hi HSG Global,\nI would like to inquire about my order #${orderRef} which was cancelled/voided. Please assist.\n🙏`;
+    const waUrl = `https://wa.me/${finalPhone}?text=${encodeURIComponent(msgText)}`;
+    const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 640;
+    if (isMobile) {
+      window.location.href = waUrl;
+    } else {
+      window.open(waUrl, "_blank");
     }
   };
 
@@ -1725,6 +1897,7 @@ export default function App() {
         unit_no: isPickup ? "Warehouse Self-Pickup" : unitNo,
         delivery_notes: deliveryNotes,
         items: cart,
+        loose_items: Object.values(looseCart),
         total_cartons: totalCartons,
         subtotal,
         discount_amount: discountInfo.discountAmount,
@@ -1841,7 +2014,11 @@ export default function App() {
 
     // Clear cart and payment timer session
     setCart([]);
+    setLooseCart({});
     setAppliedPromoCode("");
+    try {
+      localStorage.removeItem("hsg_shop_loose_cart");
+    } catch {}
     clearPaymentSession();
 
     // Set thank you order to current order, close payment modal, and navigate to /complete?ref=...
@@ -1880,7 +2057,11 @@ export default function App() {
           // Transition to Thank You page after 1.2s visual feedback
           redirectTimer = setTimeout(() => {
             setCart([]);
+            setLooseCart({});
             setAppliedPromoCode("");
+            try {
+              localStorage.removeItem("hsg_shop_loose_cart");
+            } catch {}
             clearPaymentSession();
             setThankYouOrder(confirmedOrder);
             setPaymentModalOpen(false);
@@ -2108,7 +2289,7 @@ export default function App() {
                   <div className="font-bold text-zinc-900">HSG GLOBAL PTE. LTD.</div>
                   <div>UEN: 201627632D</div>
                   <div>Warehouse: 9 Eunos Ave 8A, Eunos Industrial Estate, Singapore 409461</div>
-                  <div>Official Support WhatsApp: +65 8475 5948</div>
+                  <div>Official Support WhatsApp: {settings.whatsapp_number || "+65 80892248"}</div>
                   <div>Email: sales@hsg-global.com</div>
                 </div>
               </section>
@@ -2177,7 +2358,7 @@ export default function App() {
               <section className="space-y-2">
                 <h2 className="text-sm font-bold text-zinc-900">5. Refunds & Damaged Goods Policy</h2>
                 <p>
-                  Due to the nature of wholesale beverage distribution, orders are non-refundable once dispatched. Any transit damage or manufacturer defect must be reported within 24 hours of delivery via WhatsApp (+65 8475 5948) with photo proof for prompt replacement.
+                  Due to the nature of wholesale beverage distribution, orders are non-refundable once dispatched. Any transit damage or manufacturer defect must be reported within 24 hours of delivery via WhatsApp ({settings.whatsapp_number || "+65 80892248"}) with photo proof for prompt replacement.
                 </p>
               </section>
 
@@ -2448,8 +2629,112 @@ export default function App() {
           return Math.max(0, Number(trackedOrder.total_amount || 0) - Number(trackedOrder.delivery_fee || 0) + Number(trackedOrder.discount_amount || 0) - bcrsAmount);
         })();
 
+        const handleDownloadReceipt = async () => {
+          if (!trackedOrder) return;
+          setDownloadingReceipt(true);
+          try {
+            const receiptCard = document.getElementById("digital-receipt-card") as HTMLElement;
+            if (!receiptCard) throw new Error("Receipt card element not found");
+
+            // Create container with exact desktop/print width (780px) positioned behind screen (z-index -9999)
+            const offscreen = document.createElement("div");
+            offscreen.style.position = "fixed";
+            offscreen.style.top = "0";
+            offscreen.style.left = "0";
+            offscreen.style.width = "780px";
+            offscreen.style.maxWidth = "780px";
+            offscreen.style.backgroundColor = "#ffffff";
+            offscreen.style.padding = "28px 32px";
+            offscreen.style.boxSizing = "border-box";
+            offscreen.style.zIndex = "-9999";
+            offscreen.style.pointerEvents = "none";
+
+            // Clone the receipt card directly (100% exact DOM, no rebuild)
+            const clonedCard = receiptCard.cloneNode(true) as HTMLElement;
+            // Clean outer card styling to match the print look (borderless, flat, white)
+            clonedCard.style.border = "none";
+            clonedCard.style.borderRadius = "0";
+            clonedCard.style.boxShadow = "none";
+            clonedCard.style.padding = "0";
+            clonedCard.style.margin = "0";
+            clonedCard.style.width = "100%";
+            clonedCard.style.maxWidth = "100%";
+            clonedCard.style.backgroundColor = "#ffffff";
+
+            // Remove all elements marked print:hidden (policy links, WhatsApp receipt buttons, etc.)
+            const printHiddenElements = clonedCard.querySelectorAll(".print\\:hidden");
+            printHiddenElements.forEach((el) => el.remove());
+
+            // Ensure 2-column wide layout even when captured on mobile viewport
+            const headerRow = clonedCard.querySelector(".border-b.border-slate-200.pb-5") as HTMLElement;
+            if (headerRow) {
+              headerRow.style.display = "flex";
+              headerRow.style.flexDirection = "row";
+              headerRow.style.justifyContent = "space-between";
+              headerRow.style.alignItems = "center";
+              const receiptNumBox = headerRow.lastElementChild as HTMLElement;
+              if (receiptNumBox) {
+                receiptNumBox.style.textAlign = "right";
+                receiptNumBox.style.background = "transparent";
+                receiptNumBox.style.border = "none";
+                receiptNumBox.style.padding = "0";
+              }
+            }
+
+            const infoGrid = clonedCard.querySelector(".grid.bg-slate-50.rounded-2xl") as HTMLElement;
+            if (infoGrid) {
+              infoGrid.style.display = "grid";
+              infoGrid.style.gridTemplateColumns = "1fr 1fr";
+              infoGrid.style.gap = "16px";
+              const paymentRow = infoGrid.lastElementChild as HTMLElement;
+              if (paymentRow) {
+                paymentRow.style.gridColumn = "1 / -1";
+                paymentRow.style.display = "flex";
+                paymentRow.style.justifyContent = "space-between";
+                paymentRow.style.alignItems = "center";
+              }
+            }
+
+            const itemizedSpecs = clonedCard.querySelector("span.text-\\[11px\\].text-zinc-400") as HTMLElement;
+            if (itemizedSpecs) {
+              itemizedSpecs.style.display = "inline";
+            }
+
+            offscreen.appendChild(clonedCard);
+            document.body.appendChild(offscreen);
+
+            // Wait a tick for styles to compute
+            await new Promise((r) => setTimeout(r, 60));
+
+            // Generate crisp high-resolution PNG snapshot using html-to-image
+            const dataUrl = await toPng(offscreen, {
+              backgroundColor: "#ffffff",
+              pixelRatio: 2.5,
+              cacheBust: true,
+            });
+
+            document.body.removeChild(offscreen);
+
+            // Trigger instant PNG image download
+            const link = document.createElement("a");
+            link.download = `${trackedOrder.order_ref || "Order"}-Receipt.png`;
+            link.href = dataUrl;
+            document.body.appendChild(link);
+            link.click();
+            setTimeout(() => {
+              if (document.body.contains(link)) {
+                document.body.removeChild(link);
+              }
+            }, 1000);
+          } catch (err: any) {
+            console.error("Failed to generate receipt snapshot:", err);
+          } finally {
+            setDownloadingReceipt(false);
+          }
+        };
+
         return (
-          <div className="flex-1 flex flex-col min-h-screen bg-[#F8F9FA] font-primary">
+          <div className="flex-1 flex flex-col min-h-screen bg-[#F8F9FA] font-primary print:bg-white print:min-h-0 print:block">
             {/* Top Header (Print Hidden) */}
             <div className="sticky top-0 z-20 bg-white/95 backdrop-blur-xs border-b border-slate-200 py-3.5 px-4 shadow-2xs print:hidden">
               <div className="max-w-5xl mx-auto px-4 flex flex-col items-center justify-center text-center">
@@ -2470,14 +2755,18 @@ export default function App() {
             </div>
 
             {/* Main Tracking Content */}
-            <main className="flex-1 w-full max-w-4xl mx-auto px-4 py-6 space-y-6">
+            <main className="flex-1 w-full max-w-4xl mx-auto px-4 py-6 space-y-6 print:max-w-none print:w-full print:p-0 print:m-0 print:space-y-0 print:block">
 
-              {/* 1. TIMELINE STATUS CARD (Print Hidden) */}
+              {/* 1. TIMELINE STATUS CARD OR VOID STATUS CARD (Print Hidden) */}
               <div className="bg-white border border-slate-200 rounded-3xl p-5 sm:p-7 shadow-xs space-y-5 print:hidden">
                 <div className="flex flex-col sm:flex-row items-center justify-between gap-3 border-b border-slate-100 pb-3 text-center sm:text-left">
                   <div className="text-center sm:text-left">
-                    <h2 className="text-base font-bold text-zinc-950">Fulfillment Timeline</h2>
-                    <p className="text-xs text-zinc-500">Live order milestone tracking</p>
+                    <h2 className="text-base font-bold text-zinc-950">
+                      {statusInfo.isVoid ? "Order Status" : "Fulfillment Timeline"}
+                    </h2>
+                    <p className="text-xs text-zinc-500">
+                      {statusInfo.isVoid ? "Order status notification" : "Live order milestone tracking"}
+                    </p>
                   </div>
                   <div className="flex items-center justify-center gap-2 flex-wrap sm:flex-nowrap">
                     <button
@@ -2508,10 +2797,23 @@ export default function App() {
                       <Package size={13} className="text-[#0B57D0]" />
                       <span>My Orders</span>
                     </button>
+                    {/* Download Receipt Snapshot Button (Visible on Mobile & Desktop) */}
+                    <button
+                      type="button"
+                      onClick={handleDownloadReceipt}
+                      disabled={downloadingReceipt}
+                      className="h-8 px-3 rounded-lg inline-flex items-center gap-1.5 text-xs font-bold text-zinc-700 bg-white border border-slate-200 hover:bg-slate-50 shadow-2xs transition-all cursor-pointer shrink-0 disabled:opacity-50"
+                      title="Download Receipt Image"
+                    >
+                      <Download size={13} className="text-[#0B57D0]" />
+                      <span>{downloadingReceipt ? "Downloading..." : "Download Receipt"}</span>
+                    </button>
+
+                    {/* Print Receipt Button (Hidden on Mobile, Visible on Desktop) */}
                     <button
                       type="button"
                       onClick={() => window.print()}
-                      className="h-8 px-3 rounded-lg inline-flex items-center gap-1.5 text-xs font-bold text-zinc-700 bg-white border border-slate-200 hover:bg-slate-50 shadow-2xs transition-all cursor-pointer shrink-0"
+                      className="h-8 px-3 rounded-lg hidden sm:inline-flex items-center gap-1.5 text-xs font-bold text-zinc-700 bg-white border border-slate-200 hover:bg-slate-50 shadow-2xs transition-all cursor-pointer shrink-0"
                       title="Print Receipt"
                     >
                       <Printer size={13} />
@@ -2528,122 +2830,202 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Stepper Progress Bar (Desktop & Mobile) */}
-                <div className="relative pt-2 pb-2">
-                  <div className="grid grid-cols-5 gap-2 text-center">
-                    {timelineSteps.map((s, idx) => (
-                      <div key={idx} className="flex flex-col items-center relative">
-                        {/* Step Node */}
-                        <div
-                          className={`w-8 h-8 sm:w-9 sm:h-9 rounded-full flex items-center justify-center font-bold text-xs transition-all z-10 ${
-                            s.done
-                              ? `bg-[#0B57D0] text-white shadow-xs ${s.active ? "ring-4 ring-blue-100 ring-offset-1" : ""}`
-                              : s.active
-                              ? "bg-blue-100 text-[#0B57D0] ring-4 ring-blue-50 font-black"
-                              : "bg-slate-100 text-zinc-400 border border-slate-200"
-                          }`}
-                        >
-                          {s.done ? <Check size={16} strokeWidth={2.5} /> : s.step}
-                        </div>
-
-                        {/* Title & Desc */}
-                        <div className="mt-2 space-y-0.5">
-                          <span className={`block text-[11px] sm:text-xs font-bold leading-tight ${
-                            s.done || s.active ? "text-zinc-900" : "text-zinc-400"
-                          }`}>
-                            {s.title}
-                          </span>
-                          <span className="hidden sm:block text-[10px] text-zinc-500 leading-tight">
-                            {s.desc}
-                          </span>
-                        </div>
+                {statusInfo.isVoid ? (
+                  /* VOID / CANCELLED STATUS CARD */
+                  <div className="bg-rose-50/70 border border-rose-200 rounded-2xl p-4 sm:p-5 flex flex-col gap-3.5 text-xs">
+                    <div className="flex items-start gap-3.5">
+                      <div className="w-10 h-10 rounded-full bg-rose-100 border border-rose-200 flex items-center justify-center shrink-0 mt-0.5 text-rose-600 font-bold">
+                        <XCircle size={22} />
                       </div>
-                    ))}
-                  </div>
-
-                  {/* Connecting Bar */}
-                  <div className="absolute top-6 sm:top-6.5 left-8 right-8 h-0.5 bg-slate-200 -z-0">
-                    <div
-                      className="h-full bg-[#0B57D0] transition-all duration-500"
-                      style={{
-                        width: `${Math.max(0, Math.min(100, ((timelineSteps.filter(s => s.done).length - 1) / (timelineSteps.length - 1)) * 100))}%`
-                      }}
-                    />
-                  </div>
-                </div>
-
-                {/* Status Message Banner */}
-                <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-3.5 flex flex-col gap-2.5 text-xs">
-                  <div className="flex items-start gap-3">
-                    <Info size={16} className="text-[#0B57D0] shrink-0 mt-0.5" />
-                    <div className="space-y-0.5 flex-1">
-                      <div className="font-bold text-zinc-900 flex items-center gap-1.5 flex-wrap">
-                        <span>Current Status:</span>
-                        <span className="font-extrabold text-[#0B57D0] bg-blue-50 px-2 py-0.5 rounded-full border border-blue-200/80 text-[11px]">
-                          {statusInfo.statusText}
-                        </span>
-                        {!isVerified && (
-                          <span className="text-[11px] font-semibold text-red-600">
-                            Pending Verify Payment
+                      <div className="space-y-1.5 flex-1 min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="font-extrabold text-sm sm:text-base text-rose-950">
+                            Order Cancelled by HSG Global
                           </span>
+                          <span className="font-bold text-[10px] uppercase tracking-wider px-2.5 py-0.5 rounded-full bg-rose-200 text-rose-800 border border-rose-300">
+                            VOID
+                          </span>
+                        </div>
+
+                        <p className="text-zinc-700 leading-relaxed text-xs sm:text-sm">
+                          This order has been cancelled by HSG Global due to payment not completed or verified.
+                        </p>
+
+                        {statusInfo.rejectReason && (
+                          <div className="font-semibold text-rose-900 bg-rose-100/80 px-3 py-1.5 rounded-lg border border-rose-200/80 text-xs">
+                            <strong>Reason:</strong> {statusInfo.rejectReason}
+                          </div>
                         )}
-                      </div>
-                      <p className="text-zinc-600 leading-relaxed pt-0.5">
-                        {(() => {
-                          if (!isVerified) {
-                            return "We are verifying your PayNow transfer reference. As soon as verification is confirmed, your status will update automatically.";
-                          }
-                          if (statusInfo.isDelivered) {
-                            return isPickup
-                              ? "Your order has been collected from us. Thank you for shopping with HSG Global!"
-                              : "Your order has been safely delivered to your doorstep. Thank you for shopping with HSG Global!";
-                          }
-                          if (statusInfo.currentStep === 4) {
-                            return isPickup
-                              ? "Your cartons are packed and ready for self-pickup from us. Please quote your order ref upon collection."
-                              : "Your cartons have been loaded and dispatched with our driver. Delivery is in progress!";
-                          }
-                          if (statusInfo.currentStep === 3) {
-                            const isPacked = statusInfo.trackStatus === "ready to deliver";
-                            return isPacked && !isPickup
-                              ? "Your carton items are packed & sealed by our team, awaiting driver dispatch."
-                              : `Payment confirmed! Our team is packing your carton items for ${isPickup ? "self-pickup collection" : "doorstep delivery dispatch"}.`;
-                          }
-                          return `Payment confirmed! Order queued for our team to process.`;
-                        })()}
-                      </p>
-                    </div>
-                  </div>
 
-                  {!isVerified && (
-                    <div className="pt-2.5 border-t border-slate-200/80 flex flex-col sm:flex-row items-center justify-between gap-2.5">
-                      <span className="text-[11px] text-zinc-500 text-center sm:text-left">
-                        Paid via PayNow? Send receipt screenshot via WhatsApp to confirm faster:
+                        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pt-1 text-xs text-zinc-600 font-medium">
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-zinc-500">Order Reference:</span>
+                            <span className="font-mono font-bold text-zinc-950">{trackedOrder.order_ref}</span>
+                          </div>
+                          <span className="text-zinc-300 hidden sm:inline">•</span>
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-zinc-500">Total Amount:</span>
+                            <span className="font-mono font-bold text-zinc-950">
+                              ${Number(trackedOrder.total_amount || 0).toFixed(2)} SGD
+                            </span>
+                          </div>
+                        </div>
+
+                        <p className="text-zinc-500 pt-1 leading-relaxed text-[11px]">
+                          Please contact our support team if you need assistance, have completed your PayNow transfer, or would like help placing a new order.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="pt-3 border-t border-rose-200/70 flex flex-col sm:flex-row items-center justify-between gap-3">
+                      <span className="text-[11px] text-zinc-600 text-center sm:text-left">
+                        Need assistance with this order? Contact our support team:
                       </span>
                       <button
                         type="button"
-                        onClick={() => handleOpenWhatsAppReceipt(trackedOrder.order_ref)}
-                        className="h-8 px-3.5 rounded-xl bg-[#25D366] hover:bg-[#20bd5a] text-white font-bold text-xs inline-flex items-center gap-1.5 shadow-2xs transition-transform active:scale-98 cursor-pointer shrink-0"
+                        onClick={() => handleContactSupportForVoid(trackedOrder.order_ref)}
+                        className="h-8.5 px-4 rounded-xl bg-[#25D366] hover:bg-[#20bd5a] text-white font-bold text-xs inline-flex items-center gap-1.5 shadow-2xs transition-transform active:scale-98 cursor-pointer shrink-0"
                       >
-                        <MessageCircle size={14} />
-                        <span>Send Receipt via WhatsApp</span>
+                        <MessageCircle size={15} />
+                        <span>Contact Support via WhatsApp</span>
                       </button>
                     </div>
-                  )}
-                </div>
+                  </div>
+                ) : (
+                  <>
+                    {/* Stepper Progress Bar (Desktop & Mobile) */}
+                    <div className="relative pt-2 pb-2">
+                      <div className="grid grid-cols-5 gap-2 text-center">
+                        {timelineSteps.map((s, idx) => (
+                          <div key={idx} className="flex flex-col items-center relative">
+                            {/* Step Node */}
+                            <div
+                              className={`w-8 h-8 sm:w-9 sm:h-9 rounded-full flex items-center justify-center font-bold text-xs transition-all z-10 ${
+                                s.done
+                                  ? `bg-[#0B57D0] text-white shadow-xs ${s.active ? "ring-4 ring-blue-100 ring-offset-1" : ""}`
+                                  : s.active
+                                  ? "bg-blue-100 text-[#0B57D0] ring-4 ring-blue-50 font-black"
+                                  : "bg-slate-100 text-zinc-400 border border-slate-200"
+                              }`}
+                            >
+                              {s.done ? <Check size={16} strokeWidth={2.5} /> : s.step}
+                            </div>
+
+                            {/* Title & Desc */}
+                            <div className="mt-2 space-y-0.5">
+                              <span className={`block text-[11px] sm:text-xs font-bold leading-tight ${
+                                s.done || s.active ? "text-zinc-900" : "text-zinc-400"
+                              }`}>
+                                {s.title}
+                              </span>
+                              <span className="hidden sm:block text-[10px] text-zinc-500 leading-tight">
+                                {s.desc}
+                              </span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+
+                      {/* Connecting Bar */}
+                      <div className="absolute top-6 sm:top-6.5 left-8 right-8 h-0.5 bg-slate-200 -z-0">
+                        <div
+                          className="h-full bg-[#0B57D0] transition-all duration-500"
+                          style={{
+                            width: `${Math.max(0, Math.min(100, ((timelineSteps.filter(s => s.done).length - 1) / (timelineSteps.length - 1)) * 100))}%`
+                          }}
+                        />
+                      </div>
+                    </div>
+
+                    {/* Status Message Banner */}
+                    <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-3.5 flex flex-col gap-2.5 text-xs">
+                      <div className="flex items-start gap-3">
+                        <Info size={16} className="text-[#0B57D0] shrink-0 mt-0.5" />
+                        <div className="space-y-0.5 flex-1">
+                          <div className="font-bold text-zinc-900 flex items-center gap-1.5 flex-wrap">
+                            <span>Current Status:</span>
+                            <span className="font-extrabold text-[#0B57D0] bg-blue-50 px-2 py-0.5 rounded-full border border-blue-200/80 text-[11px]">
+                              {statusInfo.statusText}
+                            </span>
+                            {!isVerified && (
+                              <span className="text-[11px] font-semibold text-red-600">
+                                Pending Verify Payment
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-zinc-600 leading-relaxed pt-0.5">
+                            {(() => {
+                              if (!isVerified) {
+                                return "We are verifying your PayNow transfer reference. As soon as verification is confirmed, your status will update automatically.";
+                              }
+                              if (statusInfo.isDelivered) {
+                                return isPickup
+                                  ? "Your order has been collected from us. Thank you for shopping with HSG Global!"
+                                  : "Your order has been safely delivered to your doorstep. Thank you for shopping with HSG Global!";
+                              }
+                              if (statusInfo.currentStep === 4) {
+                                return isPickup
+                                  ? "Your cartons are packed and ready for self-pickup from us. Please quote your order ref upon collection."
+                                  : "Your cartons have been loaded and dispatched with our driver. Delivery is in progress!";
+                              }
+                              if (statusInfo.currentStep === 3) {
+                                const isPacked = statusInfo.trackStatus === "ready to deliver";
+                                return isPacked && !isPickup
+                                  ? "Your carton items are packed & sealed by our team, awaiting driver dispatch."
+                                  : `Payment confirmed! Our team is packing your carton items for ${isPickup ? "self-pickup collection" : "doorstep delivery dispatch"}.`;
+                              }
+                              return `Payment confirmed! Order queued for our team to process.`;
+                            })()}
+                          </p>
+                        </div>
+                      </div>
+
+                      {!isVerified && (
+                        <div className="pt-2.5 border-t border-slate-200/80 flex flex-col sm:flex-row items-center justify-between gap-2.5">
+                          <span className="text-[11px] text-zinc-500 text-center sm:text-left">
+                            Paid via PayNow? Send receipt screenshot via WhatsApp to confirm faster:
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => handleOpenWhatsAppReceipt(trackedOrder.order_ref)}
+                            className="h-8 px-3.5 rounded-xl bg-[#25D366] hover:bg-[#20bd5a] text-white font-bold text-xs inline-flex items-center gap-1.5 shadow-2xs transition-transform active:scale-98 cursor-pointer shrink-0"
+                          >
+                            <MessageCircle size={14} />
+                            <span>Send Receipt via WhatsApp</span>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </>
+                )}
               </div>
 
               {/* 2. SUMMARY PAYMENT ORDER LOOK LIKE A CLEAN DIGITAL RECEIPT */}
-              <div className="bg-white border border-slate-200 rounded-3xl p-6 sm:p-8 shadow-xs space-y-6 print:border-none print:shadow-none print:p-0">
+              <div id="digital-receipt-card" className="bg-white border border-slate-200 rounded-3xl p-6 sm:p-8 shadow-xs space-y-6 print:border-none print:shadow-none print:p-0 print:m-0 print:rounded-none print:w-full print-receipt-card relative overflow-hidden">
+                {/* VOID WATERMARK STAMP */}
+                {statusInfo.isVoid && (
+                  <div className="absolute inset-0 pointer-events-none flex items-center justify-center z-10 select-none overflow-hidden print:opacity-100">
+                    <div className="border-[6px] sm:border-[8px] border-rose-500/25 text-rose-500/25 font-black text-6xl sm:text-8xl tracking-[0.25em] uppercase px-8 sm:px-14 py-3 sm:py-5 rounded-2xl rotate-[-22deg] scale-110 font-mono select-none">
+                      VOID
+                    </div>
+                  </div>
+                )}
                 
                 {/* Receipt Top Header */}
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-200 pb-5">
                   <div className="space-y-1">
-                    <div className="font-black text-lg sm:text-xl text-zinc-950 tracking-tight flex items-center gap-2">
+                    <div className="font-black text-lg sm:text-xl text-zinc-950 tracking-tight flex items-center gap-2 flex-wrap">
                       <span>{settings.company_name || "HSG GLOBAL PTE. LTD."}</span>
-                      <span className="text-[10px] bg-slate-100 text-zinc-600 px-2 py-0.5 rounded-full font-mono font-bold">
-                        OFFICIAL RECEIPT
-                      </span>
+                      {statusInfo.isVoid ? (
+                        <span className="text-[11px] bg-rose-100 text-rose-700 border border-rose-300 px-2.5 py-0.5 rounded-full font-mono font-black tracking-wider flex items-center gap-1">
+                          <span className="w-1.5 h-1.5 rounded-full bg-rose-600"></span>
+                          VOID RECEIPT
+                        </span>
+                      ) : (
+                        <span className="text-[10px] bg-slate-100 text-zinc-600 px-2 py-0.5 rounded-full font-mono font-bold">
+                          OFFICIAL RECEIPT
+                        </span>
+                      )}
                     </div>
                     <div className="text-xs text-zinc-500 space-y-0.5">
                       <p>UEN: <strong>{settings.company_uen || "201627632D"}</strong> • Registered in Singapore</p>
@@ -2745,17 +3127,29 @@ export default function App() {
                         <span className="text-zinc-500 text-xs">Payment:</span>
                         <span
                           className={`font-bold px-2.5 py-0.5 rounded-full text-xs ${
-                            isVerified
+                            statusInfo.isVoid
+                              ? "bg-rose-50 text-rose-700 border border-rose-200"
+                              : isVerified
                               ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
                               : "bg-amber-50 text-amber-800 border border-amber-200"
                           }`}
                         >
-                          {isVerified ? "Verified / Paid" : "Pending Verification"}
+                          {statusInfo.isVoid
+                            ? "Void / Rejected"
+                            : isVerified
+                            ? "Verified / Paid"
+                            : "Pending Verification"}
                         </span>
                       </div>
                       <div className="flex items-center gap-1.5">
                         <span className="text-zinc-500 text-xs">Status:</span>
-                        <span className="font-bold px-2.5 py-0.5 rounded-full text-xs bg-blue-50 text-[#0B57D0] border border-blue-200">
+                        <span
+                          className={`font-bold px-2.5 py-0.5 rounded-full text-xs ${
+                            statusInfo.isVoid
+                              ? "bg-rose-50 text-rose-700 border border-rose-200"
+                              : "bg-blue-50 text-[#0B57D0] border border-blue-200"
+                          }`}
+                        >
                           {statusInfo.statusText}
                         </span>
                       </div>
@@ -2767,7 +3161,7 @@ export default function App() {
                 <div className="space-y-3">
                   <div className="flex items-center justify-between border-b border-slate-200 pb-2 gap-2">
                     <h3 className="font-bold text-xs uppercase tracking-wide text-zinc-900 whitespace-nowrap">
-                      Ordered Cartons ({trackedOrder.total_cartons} CTN)
+                      Ordered Items ({trackedOrder.total_cartons} CTN{trackedOrder.items?.some((it: any) => it.item_type === "loose_upsell") ? " + Add-ons" : ""})
                     </h3>
                     <span className="text-[11px] text-zinc-400 whitespace-nowrap hidden sm:inline">
                       Itemized Specifications
@@ -2776,8 +3170,11 @@ export default function App() {
 
                   <div className="divide-y divide-slate-100">
                     {trackedOrder.items?.map((item: any, idx: number) => {
-                      const isMix = item.carton_type === "custom_mix" || (item.loose_bottles && item.loose_bottles.length > 0);
-                      const lineTotal = Number(item.carton_price || 0) * Number(item.carton_qty || 1);
+                      const isLooseUpsell = item.item_type === "loose_upsell";
+                      const isMix = !isLooseUpsell && (item.carton_type === "custom_mix" || (item.loose_bottles && item.loose_bottles.length > 0));
+                      const lineTotal = isLooseUpsell
+                        ? Number(item.total_price || (item.price_per_piece * item.qty) || 0)
+                        : Number(item.carton_price || 0) * Number(item.carton_qty || 1);
                       const itemProd = item.sku ? productMap.get(item.sku) : null;
                       const hasItemBcrs = Boolean(item.has_bcrs || itemProd?.has_bcrs || (item.loose_bottles && item.loose_bottles.some((lb: any) => lb.has_bcrs || productMap.get(lb.sku)?.has_bcrs)));
 
@@ -2790,9 +3187,20 @@ export default function App() {
 
                             {/* Packaging Specifications & BCRS Badge */}
                             <div className="text-[11px] text-zinc-500 flex flex-wrap items-center gap-1.5">
-                              <span>
-                                {item.carton_qty} ctn × ${Number(item.carton_price).toFixed(2)}
-                              </span>
+                              {isLooseUpsell ? (
+                                <>
+                                  <span className="font-bold text-blue-700 bg-blue-50 px-1.5 py-0.5 rounded text-[10px] border border-blue-200">
+                                    Single Piece
+                                  </span>
+                                  <span>
+                                    {item.qty} pcs × ${Number(item.price_per_piece).toFixed(2)}
+                                  </span>
+                                </>
+                              ) : (
+                                <span>
+                                  {item.carton_qty} ctn × ${Number(item.carton_price).toFixed(2)}
+                                </span>
+                              )}
                               {item.sku && (
                                 <>
                                   <span className="text-zinc-300">•</span>
@@ -2844,7 +3252,7 @@ export default function App() {
                 {/* FINANCIAL SUMMARY / RECEIPT TOTALS */}
                 <div className="border-t-2 border-dashed border-slate-200 pt-4 space-y-2 text-xs">
                   <div className="flex justify-between text-zinc-600">
-                    <span>Cartons Subtotal:</span>
+                    <span>Subtotal:</span>
                     <span className="font-medium font-mono text-zinc-900">
                       SGD ${orderSubtotal.toFixed(2)}
                     </span>
@@ -2918,7 +3326,30 @@ export default function App() {
           {/* HERO SLIDER (FULL WIDTH, NO ROUND CORNERS, MAX 270PX)     */}
           {/* ========================================================= */}
           {Boolean(settings.show_hero_section) && (
-            <section className="w-full h-[200px] sm:h-[235px] md:h-[270px] max-h-[270px] relative overflow-hidden bg-zinc-950 text-white rounded-none select-none shrink-0">
+            loading && slides.length === 0 ? (
+              <section className="w-full h-[225px] sm:h-[260px] md:h-[290px] relative overflow-hidden bg-zinc-950 text-white rounded-none select-none shrink-0 animate-pulse flex items-center">
+                <div className="absolute inset-0 bg-gradient-to-br from-zinc-950 via-zinc-900 to-zinc-950" />
+                <div className="max-w-6xl w-full mx-auto px-4 sm:px-6 relative z-10">
+                  <div className="max-w-xl space-y-3">
+                    <div className="h-5 w-36 bg-zinc-800/80 rounded-full" />
+                    <div className="space-y-2">
+                      <div className="h-6 sm:h-7 md:h-8 w-4/5 bg-zinc-800/80 rounded-lg" />
+                      <div className="h-6 sm:h-7 md:h-8 w-3/5 bg-zinc-800/80 rounded-lg" />
+                    </div>
+                    <div className="space-y-1.5 pt-0.5">
+                      <div className="h-3.5 w-full bg-zinc-800/50 rounded" />
+                      <div className="h-3.5 w-3/4 bg-zinc-800/50 rounded" />
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2.5 pt-2">
+                      <div className="h-8 w-28 bg-zinc-800/90 rounded-xl" />
+                      <div className="h-5 w-24 bg-zinc-800/40 rounded-md" />
+                      <div className="h-5 w-28 bg-zinc-800/40 rounded-md" />
+                    </div>
+                  </div>
+                </div>
+              </section>
+            ) : slides.length > 0 ? (
+              <section className="w-full h-[225px] sm:h-[260px] md:h-[290px] relative overflow-hidden bg-zinc-950 text-white rounded-none select-none shrink-0">
               {slides.map((slide, idx) => {
                 const isActive = idx === currentSlideIndex;
                 return (
@@ -2940,8 +3371,7 @@ export default function App() {
                     <div className="max-w-6xl w-full mx-auto px-4 sm:px-6 relative z-10">
                       <div className="max-w-xl">
                         {slide.badge_text && (
-                          <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-white/10 text-amber-300 text-[11px] font-bold mb-1.5 sm:mb-2 backdrop-blur-xs">
-                            <Sparkles size={12} />
+                          <div className="inline-flex items-center px-2.5 py-0.5 rounded-full bg-white/10 text-amber-300 text-[11px] font-bold mb-1.5 sm:mb-2 backdrop-blur-xs">
                             {slide.badge_text}
                           </div>
                         )}
@@ -2960,6 +3390,30 @@ export default function App() {
                                 {tag}
                               </div>
                             ))}
+                          </div>
+                        )}
+
+                        {slide.cta_text && (
+                          <div className="mt-2.5 sm:mt-3">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (slide.cta_link && slide.cta_link.trim()) {
+                                  if (slide.cta_link.startsWith("http")) {
+                                    window.open(slide.cta_link, "_blank");
+                                  } else {
+                                    navigateTo(slide.cta_link);
+                                  }
+                                } else {
+                                  const target = document.getElementById("catalog-section") || document.querySelector("main");
+                                  target?.scrollIntoView({ behavior: "smooth" });
+                                }
+                              }}
+                              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 sm:px-4 sm:py-2 rounded-xl border border-white text-white bg-transparent hover:bg-white hover:text-zinc-950 text-xs sm:text-sm font-bold shadow-sm transition-all active:scale-95 cursor-pointer"
+                            >
+                              <span>{slide.cta_text}</span>
+                              <ArrowRight size={14} />
+                            </button>
                           </div>
                         )}
                       </div>
@@ -2999,10 +3453,11 @@ export default function App() {
                   </div>
                 </>
               )}
-            </section>
+              </section>
+            ) : null
           )}
 
-          <main className={`flex-1 max-w-6xl w-full mx-auto px-4 py-5 sm:py-6 ${totalCartons > 0 ? "pb-24 sm:pb-28" : ""}`}>
+          <main id="catalog-section" className={`flex-1 max-w-6xl w-full mx-auto px-4 py-5 sm:py-6 ${totalCartons > 0 ? "pb-24 sm:pb-28" : ""}`}>
             {/* 1. Category Filter Tabs (Scrollable on mobile, only shown if more than 1 category exists) */}
             {categories.length > 1 && (
               <div className="mb-2.5">
@@ -3015,7 +3470,7 @@ export default function App() {
                         onClick={() => handleSelectCategory(cat)}
                         className={`h-8 px-3.5 rounded-lg text-xs font-semibold transition-all cursor-pointer whitespace-nowrap flex items-center gap-1.5 shrink-0 ${
                           isSelected
-                            ? "bg-[#0B57D0] text-white shadow-xs"
+                            ? "bg-zinc-950 text-white shadow-xs"
                             : "bg-white text-zinc-700 border border-slate-200 hover:bg-slate-100"
                         }`}
                       >
@@ -3152,7 +3607,7 @@ export default function App() {
                               <div
                                 className="absolute inset-0 backdrop-blur-2xs"
                                 style={{
-                                  clipPath: "polygon(-2% 34%, 50% 31%, 102% 16%, 102% 37%, 50% 42%, -2% 52%)"
+                                  clipPath: "polygon(-2% 70%, 50% 66%, 102% 60%, 102% 79%, 50% 79%, -2% 88%)"
                                 }}
                               />
                               <svg
@@ -3166,14 +3621,14 @@ export default function App() {
                                   {/* Center guide curve for the text */}
                                   <path
                                     id={`ribbon-text-path-${safeId}`}
-                                    d="M -2 43 Q 50 36.5 102 26.5"
+                                    d="M -2 79 Q 50 72.5 102 69.5"
                                     fill="none"
                                   />
                                 </defs>
 
                                 {/* Ribbon Body (semi-transparent red ribbon, no outline, right side tilted up) */}
                                 <path
-                                  d="M -2 34 Q 50 31 102 16 L 102 37 Q 50 42 -2 52 Z"
+                                  d="M -2 70 Q 50 66 102 60 L 102 79 Q 50 79 -2 88 Z"
                                   fill="rgba(220, 38, 38, 0.78)"
                                   stroke="none"
                                   filter={`url(#ribbon-shadow-${safeId})`}
@@ -3303,9 +3758,15 @@ export default function App() {
         >
           <div className="bg-white/95 backdrop-blur-md text-zinc-900 px-3.5 py-2.5 rounded-full shadow-lg border border-slate-200 flex items-center justify-between gap-3 pointer-events-auto">
             <div className="flex items-center gap-2.5 pl-1 min-w-0">
-              <div className="w-8 h-8 rounded-full bg-slate-100 flex items-center justify-center text-zinc-700 shrink-0">
-                <ShoppingCart size={15} />
-              </div>
+              <button
+                type="button"
+                onClick={() => setClearCartPopupOpen(true)}
+                title="Clear all cartons"
+                aria-label="Clear cart"
+                className="w-8 h-8 rounded-full bg-slate-100 hover:bg-rose-50 text-zinc-500 hover:text-rose-600 flex items-center justify-center transition-colors active:scale-95 cursor-pointer shrink-0 border border-transparent hover:border-rose-200"
+              >
+                <Trash2 size={15} />
+              </button>
               <div className="text-xs truncate">
                 <div className="font-extrabold text-zinc-950 flex items-center gap-1.5 truncate">
                   <span>{totalCartons} Cartons</span>
@@ -3467,6 +3928,160 @@ export default function App() {
                     </div>
                   ))}
                 </div>
+
+                {/* Added Single Add-on Pieces (if any) */}
+                {totalLoosePieces > 0 && (
+                  <div className="space-y-3 pt-2">
+                    <div className="text-[11px] font-bold text-zinc-400 uppercase tracking-wider flex items-center justify-between">
+                      <span>Single Add-ons ({totalLoosePieces} pcs)</span>
+                      <span className="text-zinc-600 font-semibold">${totalLooseAmount.toFixed(2)}</span>
+                    </div>
+                    <div className="space-y-2">
+                      {Object.values(looseCart).map((lItem) => (
+                        <div
+                          key={lItem.sku}
+                          className="bg-white border border-slate-200 rounded-xl p-3 shadow-2xs flex items-center justify-between gap-3"
+                        >
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            {lItem.image ? (
+                              <img
+                                src={lItem.image}
+                                alt={lItem.name}
+                                className="w-10 h-10 object-contain rounded-lg bg-slate-50 border border-slate-100 p-1 shrink-0"
+                              />
+                            ) : (
+                              <div className="w-10 h-10 rounded-lg bg-slate-100 flex items-center justify-center text-zinc-400 shrink-0">
+                                <Package size={16} />
+                              </div>
+                            )}
+                            <div className="min-w-0">
+                              <div className="font-bold text-xs text-zinc-900 truncate">{lItem.name}</div>
+                              <div className="text-[11px] text-zinc-500 font-medium">
+                                ${lItem.price.toFixed(2)} / pc • Max 6 pcs
+                              </div>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-3 shrink-0">
+                            <div className="font-extrabold text-xs text-zinc-950">
+                              ${(lItem.price * lItem.qty).toFixed(2)}
+                            </div>
+                            <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-lg p-0.5">
+                              <button
+                                type="button"
+                                onClick={() => handleUpdateLooseQty(lItem.sku, -1)}
+                                className="w-6 h-6 rounded flex items-center justify-center text-zinc-600 hover:bg-slate-200 cursor-pointer active:scale-95 transition-all"
+                                title="Decrease quantity"
+                              >
+                                <Minus size={11} />
+                              </button>
+                              <span className="text-xs font-extrabold text-zinc-900 w-5 text-center">
+                                {lItem.qty}
+                              </span>
+                              <button
+                                type="button"
+                                disabled={lItem.qty >= 6}
+                                onClick={() => handleUpdateLooseQty(lItem.sku, 1)}
+                                className={`w-6 h-6 rounded flex items-center justify-center text-zinc-600 ${
+                                  lItem.qty >= 6
+                                    ? "opacity-30 cursor-not-allowed"
+                                    : "hover:bg-slate-200 cursor-pointer active:scale-95"
+                                } transition-all`}
+                                title={lItem.qty >= 6 ? "Max 6 pcs" : "Add one more"}
+                              >
+                                <Plus size={11} />
+                              </button>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveLooseItem(lItem.sku)}
+                              className="text-zinc-400 hover:text-rose-600 p-1 cursor-pointer transition-colors"
+                              title="Remove item"
+                            >
+                              <Trash2 size={13} />
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Option C: "Try Something New" Cart Drawer Upsell Shelf */}
+                {(() => {
+                  if (!settings.cart_upsell_enabled || !Array.isArray(settings.cart_upsell_items)) return null;
+                  const availableUpsellItems = settings.cart_upsell_items.filter(
+                    (item) => !looseCart[item.sku] || looseCart[item.sku].qty <= 0
+                  );
+                  if (availableUpsellItems.length === 0) return null;
+
+                  return (
+                    <div className="mt-6 pt-5 border-t border-slate-200 space-y-3">
+                      <div className="flex items-baseline justify-between gap-2">
+                        <div>
+                          <div className="text-sm font-extrabold text-zinc-950 flex items-center gap-1.5">
+                            <span>{settings.cart_upsell_title || "Try Something New"}</span>
+                          </div>
+                          <p className="text-[11px] text-zinc-500 mt-0.5">
+                            {settings.cart_upsell_subtitle || "Add single pieces to your delivery"}
+                          </p>
+                        </div>
+                        <span className="text-[10px] font-bold text-blue-700 bg-blue-50 px-2 py-0.5 rounded-full border border-blue-200 shrink-0">
+                          Max 6 pcs / item
+                        </span>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                        {availableUpsellItems.map((item) => {
+                          const prod = products.find((p) => p.sku === item.sku);
+                          const displayPrice = Number(prod?.price_per_piece ?? item.price_per_piece ?? 0);
+                          const displayName = prod?.display_name || item.display_name;
+                          const displayImg = prod?.image || item.image;
+
+                          return (
+                            <div
+                              key={item.sku}
+                              className="rounded-xl p-3 border transition-all flex items-center justify-between gap-2.5 bg-white border-slate-200 hover:border-slate-300"
+                            >
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                {displayImg ? (
+                                  <img
+                                    src={displayImg}
+                                    alt={displayName}
+                                    className="w-12 h-12 object-contain rounded-lg bg-slate-50 border border-slate-100 p-1 shrink-0"
+                                  />
+                                ) : (
+                                  <div className="w-12 h-12 rounded-lg bg-slate-100 flex items-center justify-center text-zinc-400 shrink-0">
+                                    <Package size={18} />
+                                  </div>
+                                )}
+                                <div className="min-w-0">
+                                  <div className="font-bold text-xs text-zinc-900 truncate" title={displayName}>
+                                    {displayName}
+                                  </div>
+                                  <div className="text-[11px] font-semibold text-zinc-600 mt-0.5">
+                                    ${displayPrice.toFixed(2)}{" "}
+                                    <span className="text-[10px] text-zinc-400 font-normal">/ pc</span>
+                                  </div>
+                                </div>
+                              </div>
+
+                              <div className="shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() => handleAddLooseItem(item)}
+                                  className="h-7 px-3 bg-white hover:bg-slate-50 text-[#0B57D0] hover:text-[#0842A0] border border-slate-200 hover:border-blue-300 font-bold text-xs rounded-lg inline-flex items-center gap-1 transition-all cursor-pointer shadow-2xs active:scale-95"
+                                >
+                                  <Plus size={12} />
+                                  <span>Add</span>
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })()}
               </div>
 
               {/* Right Column: Sticky Summary & Checkout Button */}
@@ -3476,10 +4091,23 @@ export default function App() {
                     Pricing Summary
                   </div>
 
-                  <div className="flex justify-between text-zinc-600 pt-1">
-                    <span>Subtotal ({totalCartons} Cartons):</span>
-                    <span className="font-semibold text-zinc-900">${subtotal.toFixed(2)}</span>
-                  </div>
+                  {totalLoosePieces > 0 ? (
+                    <>
+                      <div className="flex justify-between text-zinc-600 pt-1">
+                        <span>Cartons Subtotal ({totalCartons}):</span>
+                        <span className="font-semibold text-zinc-900">${cartonSubtotal.toFixed(2)}</span>
+                      </div>
+                      <div className="flex justify-between text-zinc-600">
+                        <span>Single Add-ons ({totalLoosePieces} pcs):</span>
+                        <span className="font-semibold text-zinc-900">${totalLooseAmount.toFixed(2)}</span>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="flex justify-between text-zinc-600 pt-1">
+                      <span>Subtotal ({totalCartons} Cartons):</span>
+                      <span className="font-semibold text-zinc-900">${subtotal.toFixed(2)}</span>
+                    </div>
+                  )}
 
                   {discountInfo.discountAmount > 0 && (
                     <div className="flex justify-between items-center text-zinc-600">
@@ -3621,10 +4249,10 @@ export default function App() {
                       <div className="bg-amber-50 border border-amber-300 rounded-2xl p-4 text-xs space-y-2.5 shadow-2xs">
                         <div className="flex items-start gap-2 text-amber-900 font-bold">
                           <AlertCircle size={16} className="text-amber-600 shrink-0 mt-0.5" />
-                          <span>Bulk Order Limit Reached (${maxOrderLimit.toLocaleString()})</span>
+                          <span>Bulk Order Limit Reached ({maxCartonLimit} Cartons)</span>
                         </div>
                         <p className="text-amber-800 leading-relaxed text-[11px]">
-                          Orders exceeding <strong>${maxOrderLimit.toLocaleString()}</strong> qualify for special volume pricing and bulk distributor discounts! Please contact our sales team on WhatsApp to receive a special price quotation.
+                          Orders exceeding <strong>{maxCartonLimit} cartons</strong> qualify for special volume pricing and bulk distributor discounts! Please contact our sales team on WhatsApp to receive a special price quotation.
                         </p>
                         <a
                           href={`https://wa.me/${(settings.whatsapp_number || "+65 80892248").replace(/\D/g, "")}?text=${encodeURIComponent(
@@ -4106,13 +4734,26 @@ export default function App() {
               <div className="lg:col-span-5 sticky top-24 space-y-4">
                 <div className="bg-slate-50 rounded-2xl p-5 border border-slate-200 space-y-3 shadow-2xs">
                   <div className="text-[11px] font-bold text-zinc-400 uppercase tracking-wider pb-1 border-b border-slate-200">
-                    Order Summary ({totalCartons} Cartons)
+                    Order Summary ({totalCartons} Cartons{totalLoosePieces > 0 ? ` + ${totalLoosePieces} Single Add-ons` : ""})
                   </div>
 
-                  <div className="flex justify-between text-zinc-600 pt-1">
-                    <span>Subtotal:</span>
-                    <span className="font-semibold text-zinc-900">${subtotal.toFixed(2)}</span>
-                  </div>
+                  {totalLoosePieces > 0 ? (
+                    <>
+                      <div className="flex justify-between text-zinc-600 pt-1">
+                        <span>Cartons Subtotal ({totalCartons}):</span>
+                        <span className="font-semibold text-zinc-900">${cartonSubtotal.toFixed(2)}</span>
+                      </div>
+                      <div className="flex justify-between text-zinc-600">
+                        <span>Single Add-ons ({totalLoosePieces} pcs):</span>
+                        <span className="font-semibold text-zinc-900">${totalLooseAmount.toFixed(2)}</span>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="flex justify-between text-zinc-600 pt-1">
+                      <span>Subtotal:</span>
+                      <span className="font-semibold text-zinc-900">${subtotal.toFixed(2)}</span>
+                    </div>
+                  )}
 
                   {discountInfo.discountAmount > 0 && (
                     <div className="flex justify-between items-center text-zinc-600">
@@ -4162,10 +4803,10 @@ export default function App() {
                       <div className="bg-amber-50 border border-amber-300 rounded-2xl p-4 text-xs space-y-2.5 shadow-2xs">
                         <div className="flex items-start gap-2 text-amber-900 font-bold">
                           <AlertCircle size={16} className="text-amber-600 shrink-0 mt-0.5" />
-                          <span>Bulk Order Limit Reached (${maxOrderLimit.toLocaleString()})</span>
+                          <span>Bulk Order Limit Reached ({maxCartonLimit} Cartons)</span>
                         </div>
                         <p className="text-amber-800 leading-relaxed text-[11px]">
-                          Orders exceeding <strong>${maxOrderLimit.toLocaleString()}</strong> qualify for special volume pricing and custom distributor discounts. Please contact our corporate sales team on WhatsApp to place your order with special pricing.
+                          Orders exceeding <strong>{maxCartonLimit} cartons</strong> qualify for special volume pricing and custom distributor discounts. Please contact our corporate sales team on WhatsApp to place your order with special pricing.
                         </p>
                         <a
                           href={`https://wa.me/${(settings.whatsapp_number || "+65 80892248").replace(/\D/g, "")}?text=${encodeURIComponent(
@@ -4517,7 +5158,7 @@ export default function App() {
               <div>
                 <div className="font-extrabold text-sm text-zinc-900">{settings.company_name}</div>
                 <div className="mt-1">UEN: {settings.company_uen} • Official Singapore Distribution</div>
-                <div className="mt-0.5">Support WhatsApp: +65 8475 5948 • {settings.support_email}</div>
+                <div className="mt-0.5">Support WhatsApp: {settings.whatsapp_number || "+65 80892248"} • {settings.support_email}</div>
               </div>
             </div>
 
@@ -4973,7 +5614,9 @@ export default function App() {
                     : "";
 
                   const badgeClass =
-                    statusInfo.currentStep === 5
+                    statusInfo.isVoid
+                      ? "bg-rose-50 text-rose-700 border-rose-200"
+                      : statusInfo.currentStep === 5
                       ? "bg-emerald-50 text-emerald-700 border-emerald-200"
                       : statusInfo.currentStep >= 2
                       ? "bg-blue-50 text-[#0B57D0] border-blue-200/80"
@@ -4993,7 +5636,7 @@ export default function App() {
                           <span className={`inline-flex items-center text-[10px] sm:text-[11px] font-bold px-2.5 py-0.5 rounded-full border ${badgeClass}`}>
                             {statusInfo.statusText}
                           </span>
-                          {statusInfo.statusText === "Order Placed" && !statusInfo.isPaid && (
+                          {statusInfo.statusText === "Order Placed" && !statusInfo.isPaid && !statusInfo.isVoid && (
                             <span className="text-[10px] sm:text-[11px] font-semibold text-red-600">
                               Pending Verify Payment
                             </span>
@@ -5033,10 +5676,77 @@ export default function App() {
         </div>
       )}
 
+      {/* ========================================================= */}
+      {/* MODAL POPUP: CLEAR CART CONFIRMATION                     */}
+      {/* ========================================================= */}
+      {clearCartPopupOpen && (
+        <div
+          onClick={() => setClearCartPopupOpen(false)}
+          className="fixed inset-0 z-[70] bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-200 cursor-pointer"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="bg-white rounded-2xl max-w-sm w-full p-6 text-center border border-slate-200 shadow-2xl space-y-4 animate-in zoom-in-95 duration-200 select-none cursor-default"
+          >
+            <div className="w-12 h-12 rounded-full bg-rose-50 border border-rose-200 text-rose-600 flex items-center justify-center mx-auto">
+              <Trash2 size={22} />
+            </div>
+
+            <div>
+              <h3 className="text-base font-extrabold text-zinc-950">Empty Shopping Cart?</h3>
+              <p className="text-xs text-zinc-600 mt-2 leading-relaxed">
+                Are you sure you want to remove all <strong>{totalCartons} {totalCartons === 1 ? "carton" : "cartons"}</strong> (${subtotal.toFixed(2)}) from your cart?
+              </p>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2.5 pt-2">
+              <button
+                type="button"
+                onClick={() => setClearCartPopupOpen(false)}
+                className="h-10 bg-white border border-zinc-300 hover:bg-zinc-100 text-zinc-700 rounded-xl text-xs font-bold transition-all cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setCart([]);
+                  setLooseCart({});
+                  setAppliedPromoCode("");
+                  try {
+                    localStorage.removeItem("hsg_shop_loose_cart");
+                  } catch {}
+                  setClearCartPopupOpen(false);
+                  setCartClearedToast(true);
+                  setTimeout(() => setCartClearedToast(false), 2500);
+                }}
+                className="h-10 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold transition-all cursor-pointer active:scale-98 shadow-xs"
+              >
+                Clear Cart
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Cart Cleared Toast */}
+      {cartClearedToast && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[80] bg-zinc-900 text-white px-5 py-3 rounded-2xl shadow-xl flex items-center gap-2.5 text-xs font-semibold animate-in fade-in slide-in-from-bottom-2 border border-zinc-700">
+          <CheckCircle2 size={16} className="text-emerald-400" />
+          <span>Shopping cart cleared</span>
+        </div>
+      )}
+
       {/* Policy Modal */}
       {policyModal && (
-        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/40 backdrop-blur-xs p-4">
-          <div className="bg-white rounded-2xl border border-slate-200 p-6 max-w-md w-full shadow-2xl">
+        <div
+          onClick={() => setPolicyModal(null)}
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/40 backdrop-blur-xs p-4 cursor-pointer"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="bg-white rounded-2xl border border-slate-200 p-6 max-w-md w-full shadow-2xl cursor-default"
+          >
             <h3 className="font-bold text-sm text-zinc-900 mb-2">
               {policyModal === "terms" ? "Delivery Terms Policy" : "Refund & Damaged Goods Policy"}
             </h3>
@@ -5045,7 +5755,7 @@ export default function App() {
             </p>
             <button
               onClick={() => setPolicyModal(null)}
-              className="mt-4 w-full h-9 bg-zinc-900 text-white rounded-lg text-xs font-bold cursor-pointer"
+              className="mt-4 w-full h-9 bg-slate-100 hover:bg-slate-200 text-zinc-800 border border-slate-200 rounded-lg text-xs font-bold transition-colors cursor-pointer"
             >
               Close
             </button>
